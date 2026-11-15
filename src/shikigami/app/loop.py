@@ -9,11 +9,20 @@ import sys
 import time
 from typing import Any
 
-from ..brain.actions import EmoteAction, IdleAction, MoveAction, RememberAction, SayAction
+from ..brain.actions import (
+    Action,
+    EmoteAction,
+    IdleAction,
+    MoveAction,
+    RememberAction,
+    SayAction,
+    format_tool_call,
+)
 from ..brain.agent import Brain
 from ..concurrency import run_detached
 from ..config import Config
 from ..hal.interfaces import HAL
+from ..hal.sim.state import SimState
 from ..memory.store import MemoryStore
 from ..perception.tracker import FaceTracker
 from ..reflexes.loop import ReflexLoop
@@ -45,7 +54,7 @@ class App:
         self.tts = tts
         self.log = log or logging.getLogger("shikigami.app")
         # SimHAL and SoftPicrawler both expose `.state` + `.dashboard`.
-        self._ui_state = getattr(hal, "state", None)
+        self._ui_state: SimState | None = getattr(hal, "state", None)
         self._dashboard = getattr(hal, "dashboard", None)
         self._reflex: ReflexLoop | None = None
         self._reflex_task: asyncio.Task | None = None
@@ -59,13 +68,13 @@ class App:
         self._ttfa_t0: float | None = None
         self._ttfa_ms: float | None = None
 
-    # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
         await self.hal.start()
         if self._dashboard is not None:
             dash = self._dashboard
             dash.on_submit = lambda line: asyncio.create_task(self._submit_text(line))
-            dash.on_close = self.request_stop  # quit button / q / window X
+            dash.on_close = self.request_stop  # quit button / window X
+            dash.on_mute_toggle = self.toggle_mic_mute
         self._play_queue = asyncio.Queue()
         self._player_task = asyncio.create_task(self._player())
         tracker = None
@@ -90,6 +99,28 @@ class App:
     def request_stop(self) -> None:
         """Ask the input loops to exit (dashboard quit button, window X, q key)."""
         self._stop_event.set()
+
+    def toggle_mic_mute(self) -> None:
+        """Dashboard Mute / Ctrl+M — pause capture; text input still works."""
+        if self._ui_state is None:
+            return
+        muted = not self._ui_state.mic_muted
+        self._ui_state.mic_muted = muted
+        self.hal.audio.set_muted(muted)
+        self._set_sim_state(mic="muted" if muted else "idle", mic_level=0.0)
+        self.log.info("mic %s", "muted" if muted else "unmuted")
+
+    def _mic_is_muted(self) -> bool:
+        return self._ui_state is not None and self._ui_state.mic_muted
+
+    async def _wait_while_muted(self) -> bool:
+        """Block until unmuted. Returns False if stop was requested."""
+        self._set_sim_state(mic="muted", mic_level=0.0)
+        while self._mic_is_muted():
+            if self._stop_event.is_set():
+                return False
+            await asyncio.sleep(0.1)
+        return True
 
     async def _race_stop(self, coro):
         """Await coro, but return None as soon as the stop event fires (cancelling coro)."""
@@ -138,7 +169,6 @@ class App:
             return f"ttfa={self._ttfa_ms:.0f}ms {summary}"
         return summary
 
-    # -- speech playback (queued, overlaps with the next LLM turn) -----------
     async def _player(self) -> None:
         while True:
             item = await self._play_queue.get()
@@ -165,7 +195,6 @@ class App:
         if data:
             await self._play_queue.put((data, fmt))
 
-    # -- one turn ----------------------------------------------------------
     def _state_dict(self) -> dict[str, Any]:
         state: dict[str, Any] = {
             "backend": self.hal.backend,
@@ -176,10 +205,20 @@ class App:
             state["last_motion"] = self._ui_state.last_motion
         return state
 
-    def _set_sim_state(self, **kw: str) -> None:
+    def _set_sim_state(self, **kw: Any) -> None:
         if self._ui_state is not None:
             for k, v in kw.items():
                 setattr(self._ui_state, k, v)
+
+    def _note_tool(self, action: Action) -> None:
+        """Push every finalized tool call into logs + dashboard tool panel."""
+        line = format_tool_call(action)
+        self.log.info("tool %s", line)
+        self._note_tool_marker(line)
+
+    def _note_tool_marker(self, line: str) -> None:
+        if self._ui_state is not None:
+            self._ui_state.append_tool(line)
 
     async def _submit_text(self, text: str) -> None:
         """Dashboard fire-and-forget entry: serialize via handle_text, log failures."""
@@ -206,12 +245,19 @@ class App:
         if self._ttfa_t0 is None:
             self._ttfa_ms = None
         self._set_sim_state(last_heard=text, status="thinking")
+        heard = text if len(text) <= 48 else text[:47] + "…"
+        self._note_tool_marker(f"── turn · {heard} ──")
         await self.bus.publish("heard", {"text": text})
         with tracker.stage("context"):
             events = self.memory.recent_events(8)
             state = self._state_dict()
 
+        noted = 0
+
         async def on_action(action) -> None:
+            nonlocal noted
+            self._note_tool(action)
+            noted += 1
             if not isinstance(action, SayAction):  # say is spoken via streamed sentences
                 await self.execute(action, tracker)
 
@@ -227,6 +273,9 @@ class App:
             result = await self.brain.respond(
                 text, events, state, on_action=on_action, on_sentence=on_sentence
             )
+        # Plain-content fallback SayActions never went through on_action.
+        for action in result.actions[noted:]:
+            self._note_tool(action)
         await asyncio.gather(*pending_tts)  # all sentences synthesized+queued before measuring play
         for action in result.actions:
             if isinstance(action, SayAction) and self._streamed_say:
@@ -297,7 +346,6 @@ class App:
                 await self.hal.audio.play(data, fmt)
             await self.hal.expression.speak_visual(False)
 
-    # -- input loop --------------------------------------------------------
     async def run(self) -> None:
         if self.cfg.sim.input == "mic" and self.stt is None:
             self.log.warning(
@@ -350,8 +398,13 @@ class App:
     async def _run_mic(self) -> None:
         assert self.stt is not None
         print("shikigami sim — listening on the mic (Ctrl-C to quit, Quit/Esc in the dashboard).")
+        print("Mute mic via the dashboard button or Ctrl+M; type in the chat field anytime.")
         print("watch Mic + Level in the dashboard side panel.")
         while True:
+            if self._mic_is_muted():
+                if not await self._race_stop(self._wait_while_muted()):
+                    return
+                continue
             try:
                 text = await self._race_stop(self._listen_once())
             except Exception as exc:
@@ -364,6 +417,9 @@ class App:
                 return
             if text is None:  # stop requested (window closed / quit button)
                 return
+            if self._mic_is_muted():
+                # Mute aborted mid-listen — don't treat as a failed utterance.
+                continue
             if text:
                 await self.handle_text(text)
             else:

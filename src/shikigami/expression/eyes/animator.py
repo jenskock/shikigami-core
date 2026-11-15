@@ -90,9 +90,9 @@ class EyeAnimator:
             side["pupil_offset_y"].velocity += dy * 8.0
 
     def set_blink_squash(self, blink_amount: float) -> None:
-        # squash vertically + slight horizontal stretch
         assert self._squash_s is not None
-        self._squash_s.set_target(max(0.08, 1.0 - blink_amount * 0.92))
+        # mild squash — full blackout reads as a glitch
+        self._squash_s.set_target(max(0.42, 1.0 - blink_amount * 0.45))
 
     def step(self, dt: float) -> tuple[EyeState, EyeState, float]:
         self._step_side(self._left_s, self.left, dt)

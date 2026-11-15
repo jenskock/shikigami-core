@@ -56,7 +56,6 @@ class MemoryStore:
     def close(self) -> None:
         self._db.close()
 
-    # facts ---------------------------------------------------------------
     def remember(self, key: str, value: str, category: str = "fact") -> None:
         self._db.execute(
             "INSERT INTO facts(key, value, category, created_at) VALUES(?,?,?,?) "
@@ -74,7 +73,6 @@ class MemoryStore:
         rows = self._db.execute("SELECT * FROM facts ORDER BY created_at").fetchall()
         return [Fact(r["key"], r["value"], r["category"], r["created_at"]) for r in rows]
 
-    # events --------------------------------------------------------------
     def log_event(self, kind: str, payload: dict | None = None) -> None:
         self._db.execute(
             "INSERT INTO events(ts, kind, payload) VALUES(?,?,?)",
@@ -88,7 +86,6 @@ class MemoryStore:
         ).fetchall()
         return [Event(r["ts"], r["kind"], json.loads(r["payload"])) for r in reversed(rows)]
 
-    # mood / kv -----------------------------------------------------------
     def set_mood(self, mood: str) -> None:
         self._db.execute(
             "INSERT INTO kv(key, value, updated_at) VALUES('mood', ?, ?) "

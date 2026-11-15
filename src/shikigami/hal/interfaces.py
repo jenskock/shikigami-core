@@ -82,6 +82,10 @@ class Audio(abc.ABC):
     @abc.abstractmethod
     async def play(self, data: bytes, fmt: str = "wav") -> None: ...
 
+    def set_muted(self, muted: bool) -> None:
+        """Optional: abort in-flight record when muted. Default no-op."""
+        _ = muted
+
 
 class Sensors(abc.ABC):
     @abc.abstractmethod

@@ -7,7 +7,8 @@ import logging
 from typing import Any, Protocol
 
 from ..interfaces import Motion
-from .soft import SERVO_LABELS
+from ..sim.state import SimState
+from .soft import SERVO_LABELS, SoftPicrawler
 
 
 class _CrawlerLike(Protocol):
@@ -45,11 +46,11 @@ class PicrawlerMotion(Motion):
 
     def __init__(
         self,
-        crawler: Any,
+        crawler: _CrawlerLike,
         log: logging.Logger,
-        state: Any | None = None,
+        state: SimState | None = None,
     ) -> None:
-        self._c: _CrawlerLike = crawler
+        self._c = crawler
         self._log = log
         self._state = state
         self._moving = False
@@ -58,26 +59,38 @@ class PicrawlerMotion(Motion):
     def moving(self) -> bool:
         return self._moving
 
-    def _publish(self, label: str) -> None:
+    def _publish(self, label: str | None = None) -> None:
         if self._state is None:
             return
-        self._state.last_motion = label
+        if label is not None:
+            self._state.last_motion = label
         angles = self._c.current_step_all_leg_angle()
-        if hasattr(self._c, "current_step_all_leg_value"):
-            coords = self._c.current_step_all_leg_value()
-        else:
-            coords = [list(c) for c in getattr(self._c, "current_coord", [])]
+        coords = self._c.current_step_all_leg_value()
         self._state.servo_angles = [float(a) for a in angles]
         self._state.leg_coords = [[float(x) for x in leg] for leg in coords]
         self._state.servo_labels = list(SERVO_LABELS)
 
-    async def _run(self, label: str, fn: Any, *args: Any, **kwargs: Any) -> None:
+    async def _run(
+        self, label: str, fn: Any, *args: Any, animate: bool = True, **kwargs: Any
+    ) -> None:
         self._log.info("[picrawler] %s", label)
         self._moving = True
+        soft = self._c if isinstance(self._c, SoftPicrawler) else None
+        prev_delay = 0.0
+        prev_cb = None
+        if soft is not None:
+            prev_delay = soft.frame_delay_s
+            # look_at is high-rate from the face tracker — keep those snaps instant
+            soft.frame_delay_s = prev_delay if animate else 0.0
+            prev_cb = soft.on_pose
+            soft.on_pose = lambda: self._publish(label)
         try:
             await asyncio.to_thread(fn, *args, **kwargs)
             self._publish(label)
         finally:
+            if soft is not None:
+                soft.on_pose = prev_cb
+                soft.frame_delay_s = prev_delay
             self._moving = False
 
     async def walk(
@@ -133,7 +146,14 @@ class PicrawlerMotion(Motion):
         if name is None:
             self._publish(f"look_at ({x:+.2f}, {y:+.2f})")
             return
-        await self._run(f"look_at ({x:+.2f}, {y:+.2f}) → {name}", self._c.do_action, name, 1, 50)
+        await self._run(
+            f"look_at ({x:+.2f}, {y:+.2f}) → {name}",
+            self._c.do_action,
+            name,
+            1,
+            50,
+            animate=False,
+        )
 
     async def stop(self) -> None:
         self._moving = False

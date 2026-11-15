@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from ..config import PerceptionConfig
+from ..hal.interfaces import Camera, Expression, Motion
 
 
 class Publisher(Protocol):
     async def publish(self, topic: str, payload: dict | None = None) -> Any: ...
 
 
+@runtime_checkable
+class _DetectingCamera(Protocol):
+    last_frame: Any | None
+    last_detections: list
+
+
 class FaceTracker:
     def __init__(
         self,
-        camera: Any,
-        motion: Any,
-        expression: Any,
+        camera: Camera,
+        motion: Motion,
+        expression: Expression,
         publish: Publisher,
         cfg: PerceptionConfig,
         detector: Any | None = None,
@@ -37,10 +44,11 @@ class FaceTracker:
     async def poll(self) -> None:
         if not self._cfg.track_faces:
             return
-        frame = getattr(self._camera, "last_frame", None)
+        preview = self._camera if isinstance(self._camera, _DetectingCamera) else None
+        frame = preview.last_frame if preview is not None else None
         if frame is None:
             frame = await self._camera.read_frame()
-        boxes = list(getattr(self._camera, "last_detections", None) or [])
+        boxes = list(preview.last_detections) if preview is not None else []
         faces = [b for b in boxes if b[0] == "face"]
         if not faces and frame is not None and self._detector is not None:
             faces = [d for d in self._detector.detect_all(frame) if d[0] == "face"]
@@ -56,11 +64,10 @@ class FaceTracker:
         fh, fw = frame.shape[:2]
         cx = (x + w / 2) / fw * 2 - 1
         cy = -((y + h / 2) / fh * 2 - 1)
+        await self._motion.look_at(cx, cy)
         if now - self._last_act < self._cfg.face_cooldown_s:
-            await self._motion.look_at(cx, cy)
             return
         self._last_act = now
-        await self._motion.look_at(cx, cy)
         if not self._face_present:
             self._face_present = True
             await self._publish(

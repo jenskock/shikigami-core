@@ -32,7 +32,7 @@ def test_system_prompt_contains_personality(tmp_path):
     brain._memory.remember("name", "Jens")
     msgs = brain.build_messages("hi", [], {"mood": "curious"})
     assert msgs[0]["role"] == "system"
-    assert "Shikigami" in msgs[0]["content"]
+    assert "Kogane" in msgs[0]["content"]
     assert "name: Jens" in msgs[0]["content"]
     assert "always reply in German" in msgs[0]["content"]
     assert msgs[1]["content"].endswith("human says: hi")
@@ -73,7 +73,9 @@ def test_streaming_emits_actions_and_sentences_incrementally(tmp_path):
     async def on_sentence(s):
         sentences.append(s)
 
-    result = asyncio.run(brain.respond("hi", [], {}, on_action=on_action, on_sentence=on_sentence))
+    result = asyncio.run(
+        brain.respond("hi", [], {"mood": "neutral"}, on_action=on_action, on_sentence=on_sentence)
+    )
     # emote finalized when the next tool call starts; say at finish_reason
     assert [type(a) for a in actions_seen] == [EmoteAction, SayAction]
     # "Hi there!" streamed as soon as its sentence boundary arrived; tail flushed at end

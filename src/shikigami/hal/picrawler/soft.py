@@ -9,6 +9,7 @@ gait patterns follow SunFounder's PiCrawler docs / library behaviour
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -461,6 +462,8 @@ class SoftPicrawler:
         self,
         pin_list: list[int] | None = None,
         init_angles: list[float] | None = None,
+        *,
+        frame_delay_s: float = 0.0,
     ) -> None:
         self.pin_list = list(pin_list or self.PIN_LIST)
         self.move_list = MoveList()
@@ -474,6 +477,8 @@ class SoftPicrawler:
         self.coord_temp = [[60.0, 0.0, -30.0] for _ in range(4)]
         self.servo_positions = list(init_angles) if init_angles is not None else [0.0] * 12
         self.offset = [0.0] * 12
+        self.frame_delay_s = float(frame_delay_s)  # >0 animates BODY panel; tests leave 0
+        self.on_pose: Callable[[], None] | None = None
 
     def coord2polar(self, coord: list[float]) -> list[float]:
         x, y, z = coord
@@ -550,7 +555,6 @@ class SoftPicrawler:
     def set_angle(
         self, angles_list: list[list[float]], speed: int = 50, israise: bool = False
     ) -> list[float]:
-        del speed  # timing is handled by the HAL / host; soft just stores poses
         translate: list[float] = []
         limited_any = False
         for angles in angles_list:
@@ -569,6 +573,13 @@ class SoftPicrawler:
         else:
             self.current_coord = [list(c) for c in self.coord_temp]
         self.servo_positions = list(translate)
+        if self.on_pose is not None:
+            self.on_pose()
+        delay = self.frame_delay_s
+        if delay > 0:
+            # Higher SDK speed → shorter pause (speed 50 ≈ full delay).
+            factor = max(0.2, (110 - max(0, min(100, int(speed)))) / 60.0)
+            time.sleep(delay * factor)
         return list(translate)
 
     def do_step(self, _step: str | list, speed: int = 50, israise: bool = False) -> None:

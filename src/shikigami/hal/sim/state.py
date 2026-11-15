@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+_TOOL_LOG_MAX = 200
+
 
 class SimState:
     def __init__(self, backend: str = "sim") -> None:
@@ -13,9 +15,19 @@ class SimState:
         self.status: str = "idle"
         self.mic: str = ""
         self.mic_level: float = 0.0
+        self.mic_muted: bool = False
         self.gaze_x: float = 0.0  # -1..1, drives eye look (from look_at / face tracker)
         self.gaze_y: float = 0.0
         # Body / servo telemetry (picrawler soft or real, when published by Motion).
         self.servo_angles: list[float] = []
         self.servo_labels: list[str] = []
         self.leg_coords: list[list[float]] = []
+        self.tool_log: list[str] = []  # dashboard TOOLS panel (newest last)
+
+    def append_tool(self, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
+        self.tool_log.append(text)
+        if len(self.tool_log) > _TOOL_LOG_MAX:
+            del self.tool_log[: len(self.tool_log) - _TOOL_LOG_MAX]

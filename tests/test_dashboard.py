@@ -101,6 +101,136 @@ def test_submit_line_fires_on_submit():
     assert submitted == ["hello"]
 
 
+def test_toggle_mute_fires_callback():
+    dash = SimDashboard(enabled=False)
+    calls = []
+    dash.on_mute_toggle = lambda: calls.append(True)
+    dash.toggle_mute()
+    assert calls == [True]
+
+
+def test_sync_widgets_shows_muted():
+    dash = SimDashboard(enabled=False)
+    st = SimState()
+    st.mic = "listening…"
+    st.mic_level = 0.8
+    st.mic_muted = True
+    dash.state = st
+    dash._labels = {
+        "backend": _FakeLabel(),
+        "mood": _FakeLabel(),
+        "face": _FakeLabel(),
+        "motion": _FakeLabel(),
+        "status": _FakeLabel(),
+        "heard": _FakeLabel(),
+        "latency": _FakeLabel(),
+        "mic": _FakeLabel(),
+    }
+    dash._mic_bar = _FakeBar()
+    dash._mute_btn = _FakeMuteBtn()
+    dash._sync_widgets()
+    assert dash._labels["mic"].text() == "muted"
+    assert dash._mic_bar.value() == 0
+    assert dash._mute_btn.text().startswith("Unmute")
+
+
+def test_sync_tools_shows_tool_log():
+    dash = SimDashboard(enabled=False)
+    st = SimState()
+    st.append_tool("── turn · can you blink? ──")
+    st.append_tool("emote(name='happy')")
+    st.append_tool("say(text='Of course!')")
+    dash.state = st
+    dash._tools_view = _FakeToolsView()
+    dash._sync_widgets()
+    text = dash._tools_view.toPlainText()
+    assert "emote(name='happy')" in text
+    assert "say(text=" in text
+    assert dash._tools_len == 3
+    dash._sync_widgets()  # unchanged log → no rewrite
+    assert dash._tools_view.writes == 1
+
+
+def test_append_tool_trims():
+    st = SimState()
+    for i in range(250):
+        st.append_tool(f"emote(name='n{i}')")
+    assert len(st.tool_log) == 200
+    assert st.tool_log[0] == "emote(name='n50')"
+
+
+class _FakeLabel:
+    def __init__(self) -> None:
+        self._t = ""
+
+    def text(self) -> str:
+        return self._t
+
+    def setText(self, t: str) -> None:
+        self._t = t
+
+
+class _FakeBar:
+    def __init__(self) -> None:
+        self._v = -1
+        self._name = ""
+
+    def value(self) -> int:
+        return self._v
+
+    def setValue(self, v: int) -> None:
+        self._v = v
+
+    def setObjectName(self, name: str) -> None:
+        self._name = name
+
+    def style(self):
+        return self
+
+    def unpolish(self, _w) -> None:
+        return None
+
+    def polish(self, _w) -> None:
+        return None
+
+
+class _FakeMuteBtn(_FakeLabel):
+    def __init__(self) -> None:
+        super().__init__()
+        self._props: dict[str, str] = {}
+
+    def property(self, key: str):
+        return self._props.get(key)
+
+    def setProperty(self, key: str, value: str) -> None:
+        self._props[key] = value
+
+    def style(self):
+        return self
+
+    def unpolish(self, _w) -> None:
+        return None
+
+    def polish(self, _w) -> None:
+        return None
+
+
+class _FakeToolsView:
+    def __init__(self) -> None:
+        self._t = ""
+        self.writes = 0
+
+    def toPlainText(self) -> str:
+        return self._t
+
+    def setPlainText(self, t: str) -> None:
+        self._t = t
+        self.writes += 1
+
+    def verticalScrollBar(self):
+        return None
+
+
 def test_set_camera_copies_into_cam_buf():
     dash = SimDashboard(enabled=False)
     frame = np.full((CAM_H, CAM_W, 3), 90, dtype=np.uint8)

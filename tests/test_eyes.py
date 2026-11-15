@@ -91,7 +91,7 @@ def test_blink_schedule_is_deterministic_with_seed():
         saw_close = False
         for _ in range(5000):
             prev = life.blink.phase
-            life.update(0.01, tracking=False)
+            life.update(0.01)
             t += 0.01
             if prev == "idle" and life.blink.phase == "closing":
                 times.append(round(t, 4))
@@ -116,14 +116,21 @@ def test_engine_look_at_and_blink_update_frame():
         eng.update(1 / 60)
     assert abs(eng.frame.left.pupil_offset_x) > 0.05
     eng.blink()
-    closed = False
+    blinked = False
     for _ in range(40):
         f = eng.update(1 / 60)
-        # fully closed blink drives lids + vertical squash
-        if f.left.top_lid_coverage > 0.55 or f.left.height < 0.25:
-            closed = True
+        # soft blink: lids rise and height squashes, but eyes stay visible
+        if f.left.top_lid_coverage > 0.25 or f.left.height < 0.85:
+            blinked = True
             break
-    assert closed
+    assert blinked
+    # never fully black out
+    eng2 = EyesEngine(EyesConfig(seed=3, personality="calm"))
+    eng2.blink()
+    for _ in range(30):
+        f = eng2.update(1 / 60)
+        assert f.left.height >= 0.35
+        assert f.left.top_lid_coverage <= 0.85
 
 
 def test_react_startle_sets_surprised():

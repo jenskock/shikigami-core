@@ -12,7 +12,7 @@ from shikigami.app.latency import LatencyTracker
 from shikigami.app.loop import App
 from shikigami.config import load_config
 from shikigami.hal.sim import audio as audio_mod
-from shikigami.hal.sim.audio import SimAudio, _resample_int16
+from shikigami.hal.sim.audio import SimAudio, _prepare_play_pcm, _resample_int16
 from shikigami.memory.store import MemoryStore
 
 np = pytest.importorskip("numpy")
@@ -120,6 +120,46 @@ def test_handle_text_serializes_concurrent_turns(tmp_path):
     assert max_active == 1
 
 
+def test_toggle_mic_mute_updates_state_and_audio(tmp_path):
+    app = _app(tmp_path, stt=None)
+    muted_flags = []
+    app._ui_state = SimpleNamespace(mic_muted=False, mic="", mic_level=1.0)
+    app.hal.audio = SimpleNamespace(set_muted=muted_flags.append)
+
+    app.toggle_mic_mute()
+    assert app._ui_state.mic_muted is True
+    assert app._ui_state.mic == "muted"
+    assert app._ui_state.mic_level == 0.0
+    assert muted_flags == [True]
+
+    app.toggle_mic_mute()
+    assert app._ui_state.mic_muted is False
+    assert app._ui_state.mic == "idle"
+    assert muted_flags == [True, False]
+
+
+def test_run_mic_skips_listen_while_muted(tmp_path):
+    app = _app(tmp_path, stt=SimpleNamespace(transcribe=lambda wav: "hi"))
+    app._ui_state = SimpleNamespace(mic_muted=True, mic="", mic_level=0.0)
+    listened = []
+
+    async def fake_listen():
+        listened.append(True)
+        return "should-not-run"
+
+    async def stop_soon():
+        await asyncio.sleep(0.15)
+        app.request_stop()
+
+    app._listen_once = fake_listen
+
+    async def main():
+        await asyncio.gather(app._run_mic(), stop_soon())
+
+    asyncio.run(main())
+    assert listened == []
+
+
 def test_sim_audio_from_sim_config_copies_vad():
     cfg = load_config()
     cfg.sim.vad_threshold = 123.0
@@ -163,6 +203,59 @@ def test_resample_int16_halves_rate():
     out = _resample_int16(pcm, 16000, 8000, np)
     assert out.dtype == np.int16
     assert len(out) == 4
+
+
+def test_prepare_play_pcm_resamples_and_soft_limits_peak():
+    # Piper-like: full-scale tone @ 22050 → device 48000 with headroom
+    n = 2205  # 0.1 s
+    t = np.arange(n, dtype=np.float32) / 22050.0
+    pcm = (np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+    out = _prepare_play_pcm(pcm, channels=1, src_sr=22050, dst_sr=48000, np=np)
+    assert out.dtype == np.int16
+    assert abs(len(out) - int(round(n * 48000 / 22050))) <= 1
+    assert int(np.max(np.abs(out))) <= 28000
+
+
+def test_play_uses_device_native_rate(monkeypatch):
+    import io
+    import wave
+
+    played = {}
+
+    class FakeSD:
+        def query_devices(self, idx=None, kind=None):
+            del kind
+            return {
+                "name": "MacBook Air-Lautsprecher",
+                "index": 2,
+                "max_output_channels": 2,
+                "default_samplerate": 48000.0,
+            }
+
+        def play(self, data, samplerate=None, device=None, blocking=None):
+            played["n"] = len(data)
+            played["sr"] = samplerate
+            played["device"] = device
+            played["blocking"] = blocking
+            played["peak"] = int(np.max(np.abs(data)))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        tone = (np.sin(np.linspace(0, 20, 2205)) * 32767).astype(np.int16)
+        w.writeframes(tone.tobytes())
+
+    monkeypatch.setattr(audio_mod, "_require_audio", lambda: (FakeSD(), np))
+    monkeypatch.setattr(audio_mod.time, "sleep", lambda *_a, **_k: None)
+    a = SimAudio(speaker_device=2)
+    asyncio.run(a.play(buf.getvalue(), "wav"))
+    assert played["sr"] == 48000
+    assert played["device"] == 2
+    assert played["blocking"] is True
+    assert played["peak"] <= 28000
+    assert played["n"] > 2205  # upsampled
 
 
 class _FakeStream:
@@ -261,3 +354,21 @@ def test_record_silence_aborts_at_listen_s_and_returns_empty(monkeypatch, caplog
     assert "no speech detected" in caplog.text
     # ~0.5 s of 100 ms chunks, not a full 8 s
     assert a._vad_listen_s == 0.5
+
+
+def test_record_aborts_when_muted(monkeypatch, caplog):
+    native = 16000
+    a = SimAudio(sample_rate=16000, vad_threshold=40.0, vad_listen_s=3.0, mic_gain=1.0)
+
+    def mute_after_a_few_chunks(call, n):
+        if call >= 3:
+            a.set_muted(True)
+        return (np.ones(n, dtype=np.int16) * 3).reshape(-1, 1)
+
+    fake = _FakeSD(mute_after_a_few_chunks, native_sr=native)
+    monkeypatch.setattr(audio_mod, "_require_audio", lambda: (fake, np))
+    with caplog.at_level(logging.INFO, logger="shikigami.sim.audio"):
+        wav = asyncio.run(a.record(max_s=8.0))
+    assert wav == b""
+    assert fake.calls < 20
+    assert "muted" in caplog.text

@@ -73,6 +73,20 @@ def test_picrawler_motion_publishes_servos():
     asyncio.run(_run())
 
 
+def test_soft_on_pose_fires_each_frame():
+    c = SoftPicrawler(frame_delay_s=0.0)
+    poses: list[list[list[float]]] = []
+
+    def _capture() -> None:
+        poses.append([list(leg) for leg in c.current_step_all_leg_value()])
+
+    c.on_pose = _capture
+    c.do_step("stand", 40)
+    assert len(poses) >= 2
+    # At least one intermediate frame differs from the final stand pose.
+    assert any(p != poses[-1] for p in poses[:-1])
+
+
 def test_create_picrawler_hal_soft_fallback():
     import sys
 
@@ -89,7 +103,7 @@ def test_create_picrawler_hal_soft_fallback():
     assert isinstance(hal.motion, PicrawlerMotion)
     assert hal.state is not None
     assert hal.dashboard is not None
-    assert getattr(hal.dashboard, "state", None) is hal.state
+    assert hal.dashboard.state is hal.state
     assert "robot_hat" not in sys.modules
     assert "vilib" not in sys.modules
 

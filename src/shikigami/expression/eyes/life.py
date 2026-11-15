@@ -11,9 +11,10 @@ from .state import EyesConfig
 
 @dataclass(slots=True)
 class BlinkEvent:
-    """One blink pulse; amount goes 0→1→0 over the blink."""
+    """One blink pulse; amount goes 0→peak→0 (peak < 1 keeps a visible slit)."""
 
     amount: float = 0.0
+    peak: float = 0.78
     phase: str = "idle"  # idle | closing | opening | hold
     queue: int = 0  # remaining blinks in a double-blink chain
     side: str = "both"  # both | left | right
@@ -42,6 +43,8 @@ class LifeLayer:
     # brow asymmetry drift
     brow_asym: float = 0.0
     _hold_s: float = 0.0
+    _close_speed: float = 10.0
+    _open_speed: float = 12.0
 
     def __post_init__(self) -> None:
         if self.cfg.seed is not None:
@@ -57,7 +60,8 @@ class LifeLayer:
         return -math.log(u) / lam
 
     def _schedule_blink(self) -> None:
-        self._next_blink_s = self._poisson_interval(self.cfg.blink_rate_per_min)
+        gap = self._poisson_interval(self.cfg.blink_rate_per_min)
+        self._next_blink_s = max(2.8, gap)  # floor so Poisson can't fire back-to-back
 
     def _schedule_wander(self) -> None:
         self._next_wander_s = 0.8 + self.rng.random() * 2.4
@@ -75,14 +79,18 @@ class LifeLayer:
         self.blink.side = side
         self.blink.phase = "closing"
         self.blink.queue = 1 if double else 0
+        self.blink.peak = 0.72 + self.rng.random() * 0.14  # soft close, visible slit
+        self._close_speed = 9.0 + self.rng.random() * 2.5
+        self._open_speed = 11.0 + self.rng.random() * 3.0
 
     def request_wink(self, side: str) -> None:
         self.request_blink(side=side)
+        self.blink.peak = 0.82
 
-    def update(self, dt: float, *, tracking: bool) -> None:
+    def update(self, dt: float) -> None:
         self._t += dt
         self._update_blink(dt)
-        self._update_wander(dt, tracking=tracking)
+        self._update_wander(dt)
         self._update_saccade(dt)
         self.breath = math.sin(self._t * 1.7) * self.cfg.breath_amp
         self.brow_asym = 0.04 * math.sin(self._t * 0.37 + 0.6)
@@ -96,40 +104,35 @@ class LifeLayer:
                 self.request_blink(double=double)
                 self._schedule_blink()
             return
-        # closing / opening with squash-friendly ease
-        close_speed = 14.0 + self.rng.random() * 4.0
-        open_speed = 18.0 + self.rng.random() * 6.0
+        peak = b.peak
         if b.phase == "closing":
-            b.amount = min(1.0, b.amount + close_speed * dt)
-            if b.amount >= 1.0:
-                b.amount = 1.0
+            b.amount = min(peak, b.amount + self._close_speed * dt)
+            if b.amount >= peak:
+                b.amount = peak
                 b.phase = "hold"
-                self._hold_s = 0.02 + self.rng.random() * 0.04
+                self._hold_s = 0.015 + self.rng.random() * 0.025
         elif b.phase == "hold":
             self._hold_s -= dt
             if self._hold_s <= 0.0:
                 b.phase = "opening"
         elif b.phase == "opening":
-            b.amount = max(0.0, b.amount - open_speed * dt)
+            b.amount = max(0.0, b.amount - self._open_speed * dt)
             if b.amount <= 0.0:
                 b.amount = 0.0
                 if b.queue > 0:
                     b.queue -= 1
+                    b.peak = 0.70 + self.rng.random() * 0.12
+                    self._close_speed = 9.0 + self.rng.random() * 2.5
+                    self._open_speed = 11.0 + self.rng.random() * 3.0
                     b.phase = "closing"
                 else:
                     b.phase = "idle"
                     b.side = "both"
 
-    def _update_wander(self, dt: float, *, tracking: bool) -> None:
-        if tracking:
-            # gently settle wander when actively tracking a face
-            self.wander_x += (0.0 - self.wander_x) * min(1.0, 4.0 * dt)
-            self.wander_y += (0.0 - self.wander_y) * min(1.0, 4.0 * dt)
-            return
+    def _update_wander(self, dt: float) -> None:
         self._next_wander_s -= dt
         if self._next_wander_s <= 0.0:
             self._schedule_wander()
-        # soft approach to wander target (not a linear tween — exp decay)
         k = 1.0 - math.exp(-2.2 * dt)
         self.wander_x += (self._wander_tx - self.wander_x) * k
         self.wander_y += (self._wander_ty - self.wander_y) * k

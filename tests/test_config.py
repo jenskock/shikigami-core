@@ -33,7 +33,7 @@ def test_env_overrides_llm(monkeypatch):
 
 def test_personality_loads():
     p = load_personality(REPO_ROOT / "config" / "personality.yaml")
-    assert p.name == "Shikigami"
+    assert p.name == "Kogane"
     assert p.character
     assert p.language == "German"  # matches the de_DE piper voice
     assert len(p.rules) >= 3

@@ -16,13 +16,16 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .body_view import BodyView
+from .state import SimState
+
 # How often the dedicated Qt pump runs. Keystrokes only appear when processEvents
 # runs — it must not wait on the ~20 Hz reflex/camera tick.
 _PUMP_DT_S = 0.01
 
 # Device face framebuffer (OLED-sim). Eyes render into this 1:1; UI only displays it.
 FACE_W, FACE_H = 480, 560
-CAM_W, CAM_H = 640, 360
+CAM_W, CAM_H = 400, 225
 
 _BG = "#12141a"
 _PANEL = "#1a1d26"
@@ -49,21 +52,24 @@ QPushButton#quit {{
   background: {_BORDER}; color: {_TEXT}; border: none; border-radius: 8px; padding: 10px;
 }}
 QPushButton#quit:hover {{ background: {_DANGER}; }}
+QPushButton#mute {{
+  background: {_BORDER}; color: {_TEXT}; border: none; border-radius: 8px; padding: 8px 10px;
+}}
+QPushButton#mute:hover {{ background: {_FIELD}; }}
+QPushButton#mute[muted="true"] {{
+  background: {_DANGER}; color: {_TEXT};
+}}
 QProgressBar {{
   background: {_BORDER}; border: none; border-radius: 4px; height: 8px; text-align: center;
 }}
 QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 4px; }}
-QProgressBar#servo {{
-  background: {_BORDER}; border: none; border-radius: 3px; height: 6px; max-width: 120px;
+QProgressBar#muted::chunk {{ background: {_MUTED}; border-radius: 4px; }}
+QPlainTextEdit#tools {{
+  background: {_FIELD}; border: 1px solid {_BORDER}; border-radius: 8px;
+  padding: 6px 8px; color: {_TEXT}; font-family: Menlo, Monaco, monospace;
+  font-size: 11px;
 }}
-QProgressBar#servo::chunk {{ background: {_ACCENT}; border-radius: 3px; }}
-QLabel#servo_key {{ color: {_MUTED}; font-size: 11px; min-width: 72px; }}
-QLabel#servo_val {{ color: {_TEXT}; font-size: 11px; min-width: 40px; }}
 """
-
-# Servo angle display range for progress bars (degrees).
-_SERVO_DEG_MIN = -90.0
-_SERVO_DEG_MAX = 90.0
 
 
 class SimDashboard:
@@ -82,21 +88,23 @@ class SimDashboard:
         self._cam_label: Any | None = None
         self._entry: Any | None = None
         self._mic_bar: Any | None = None
+        self._mute_btn: Any | None = None
         self._labels: dict[str, Any] = {}
-        self._servo_bars: list[Any] = []
-        self._servo_vals: list[Any] = []
-        self._servo_keys: list[Any] = []
-        self._servos_panel: Any | None = None
-        self.state: Any | None = None
+        self._body_view: BodyView | None = None
+        self._tools_view: Any | None = None
+        self._tools_len: int = -1
+        self.state: SimState | None = None
         self.emotion: str = "neutral"
         self.face_buf = np.zeros((FACE_H, FACE_W, 3), dtype=np.uint8)
         self.cam_buf = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
         self.on_submit: Callable[[str], None] | None = None
         self.on_close: Callable[[], None] | None = None
+        self.on_mute_toggle: Callable[[], None] | None = None
         self._input_fallback = ""
         self._pump_task: asyncio.Task | None = None
         self._face_dirty = True
         self._cam_dirty = True
+        self._mic_bar_muted: bool | None = None
 
         if enabled:
             try:
@@ -132,6 +140,7 @@ class SimDashboard:
                 QHBoxLayout,
                 QLabel,
                 QLineEdit,
+                QPlainTextEdit,
                 QProgressBar,
                 QPushButton,
                 QVBoxLayout,
@@ -146,29 +155,36 @@ class SimDashboard:
 
             win = QWidget()
             win.setWindowTitle("shikigami")
-            win.resize(1520, 640)
-            win.setMinimumSize(1100, 520)
+            win.resize(1280, 720)
+            win.setMinimumSize(1080, 560)
             root = QHBoxLayout(win)
             root.setContentsMargins(16, 16, 16, 16)
             root.setSpacing(12)
 
-            # Face — exact device pixels
+            # Face — exact device pixels, centered in panel
             face_panel = QFrame()
             face_panel.setObjectName("panel")
+            face_panel.setFixedWidth(FACE_W + 32)
             face_l = QVBoxLayout(face_panel)
+            face_l.setContentsMargins(16, 16, 16, 16)
+            face_l.setSpacing(8)
             face_title = QLabel("FACE")
             face_title.setObjectName("section")
-            face_l.addWidget(face_title)
+            face_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             self._face_label = QLabel()
             self._face_label.setFixedSize(FACE_W, FACE_H)
             self._face_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            face_l.addWidget(self._face_label)
+            self._face_label.setScaledContents(True)
+            face_l.addStretch(1)
+            face_l.addWidget(face_title, 0, Qt.AlignmentFlag.AlignHCenter)
+            face_l.addWidget(self._face_label, 0, Qt.AlignmentFlag.AlignHCenter)
+            face_l.addStretch(1)
             root.addWidget(face_panel, 0)
 
-            # Stats + input
+            # Stats + tools + input
             side = QFrame()
             side.setObjectName("panel")
-            side.setMinimumWidth(260)
+            side.setMinimumWidth(300)
             side_l = QVBoxLayout(side)
             brand = QLabel("shikigami")
             brand.setObjectName("brand")
@@ -206,6 +222,22 @@ class SimDashboard:
             self._mic_bar.setTextVisible(False)
             self._mic_bar.setFixedHeight(8)
             side_l.addWidget(self._mic_bar)
+            self._mute_btn = QPushButton("Mute mic  (Ctrl+M)")
+            self._mute_btn.setObjectName("mute")
+            self._mute_btn.setProperty("muted", "false")
+            self._mute_btn.clicked.connect(self.toggle_mute)
+            side_l.addWidget(self._mute_btn)
+
+            tools_title = QLabel("TOOLS")
+            tools_title.setObjectName("section")
+            side_l.addSpacing(10)
+            side_l.addWidget(tools_title)
+            self._tools_view = QPlainTextEdit()
+            self._tools_view.setObjectName("tools")
+            self._tools_view.setReadOnly(True)
+            self._tools_view.setPlaceholderText("tool calls appear here as the LLM fires them")
+            self._tools_view.setMinimumHeight(160)
+            side_l.addWidget(self._tools_view, 1)
 
             say = QLabel("SAY SOMETHING")
             say.setObjectName("section")
@@ -221,60 +253,54 @@ class SimDashboard:
             quit_btn.clicked.connect(self._request_close)
             side_l.addSpacing(8)
             side_l.addWidget(quit_btn)
-            side_l.addStretch(1)
             root.addWidget(side, 1)
 
-            # Servos — 12 joints (picrawler); empty until motion publishes angles
-            servos = QFrame()
-            servos.setObjectName("panel")
-            servos.setMinimumWidth(220)
-            servos_l = QVBoxLayout(servos)
-            servos_title = QLabel("SERVOS")
-            servos_title.setObjectName("section")
-            servos_l.addWidget(servos_title)
-            self._servo_bars = []
-            self._servo_vals = []
-            self._servo_keys = []
-            for i in range(12):
-                row = QHBoxLayout()
-                k = QLabel(f"S{i}")
-                k.setObjectName("servo_key")
-                bar = QProgressBar()
-                bar.setObjectName("servo")
-                bar.setRange(0, 100)
-                bar.setTextVisible(False)
-                bar.setFixedHeight(6)
-                v = QLabel("—")
-                v.setObjectName("servo_val")
-                row.addWidget(k)
-                row.addWidget(bar, 1)
-                row.addWidget(v)
-                servos_l.addLayout(row)
-                self._servo_keys.append(k)
-                self._servo_bars.append(bar)
-                self._servo_vals.append(v)
-            servos_l.addStretch(1)
-            self._servos_panel = servos
-            root.addWidget(servos, 0)
+            # Body + camera stacked on the right
+            right = QVBoxLayout()
+            right.setSpacing(12)
 
-            # Camera
+            body = QFrame()
+            body.setObjectName("panel")
+            body.setFixedWidth(CAM_W + 32)
+            body_l = QVBoxLayout(body)
+            body_l.setContentsMargins(16, 16, 16, 16)
+            body_l.setSpacing(8)
+            body_title = QLabel("BODY")
+            body_title.setObjectName("section")
+            body_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            body_l.addWidget(body_title, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._body_view = BodyView()
+            self._body_view.setMinimumHeight(200)
+            body_l.addWidget(self._body_view, 1)
+            right.addWidget(body, 1)
+
             cam_panel = QFrame()
             cam_panel.setObjectName("panel")
+            cam_panel.setFixedWidth(CAM_W + 32)
             cam_l = QVBoxLayout(cam_panel)
+            cam_l.setContentsMargins(16, 16, 16, 16)
+            cam_l.setSpacing(8)
             cam_title = QLabel("CAMERA")
             cam_title.setObjectName("section")
-            cam_l.addWidget(cam_title)
+            cam_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             self._cam_label = QLabel()
             self._cam_label.setFixedSize(CAM_W, CAM_H)
             self._cam_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cam_l.addWidget(self._cam_label, 1)
-            root.addWidget(cam_panel, 2)
+            self._cam_label.setScaledContents(True)
+            cam_l.addWidget(cam_title, 0, Qt.AlignmentFlag.AlignHCenter)
+            cam_l.addWidget(self._cam_label, 0, Qt.AlignmentFlag.AlignHCenter)
+            right.addWidget(cam_panel, 0)
+
+            root.addLayout(right, 0)
 
             win.closeEvent = self._on_close_event  # type: ignore[method-assign]
             from PySide6.QtGui import QKeySequence, QShortcut
 
-            # Esc only — a "Q" shortcut would steal the letter from the chat field.
+            # Esc / Ctrl+M — bare letter shortcuts would steal keys from the chat field.
             QShortcut(QKeySequence(Qt.Key.Key_Escape), win, self._request_close)
+            mute_sc = QShortcut(QKeySequence("Ctrl+M"), win)
+            mute_sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            mute_sc.activated.connect(self.toggle_mute)
             self._win = win
             win.show()
             app.processEvents()
@@ -326,6 +352,8 @@ class SimDashboard:
         st = self.state
         if st is None:
             return
+        muted = bool(st.mic_muted)
+        mic_text = "muted" if muted else (st.mic or "—")
         mapping = {
             "backend": f"backend · {st.backend}",
             "mood": st.mood or "—",
@@ -334,42 +362,60 @@ class SimDashboard:
             "status": st.status or "—",
             "heard": (st.last_heard or "—")[:48],
             "latency": (st.last_latency or "—")[:48],
-            "mic": st.mic or "—",
+            "mic": mic_text,
         }
         for key, value in mapping.items():
             lab = self._labels.get(key)
             if lab is not None and lab.text() != value:
                 lab.setText(value)
         if self._mic_bar is not None:
-            self._mic_bar.setValue(int(max(0.0, min(1.0, float(st.mic_level))) * 100))
-        self._sync_servos(st)
+            level = 0.0 if muted else float(st.mic_level)
+            self._mic_bar.setValue(int(max(0.0, min(1.0, level)) * 100))
+            if self._mic_bar_muted is not muted:
+                self._mic_bar_muted = muted
+                self._mic_bar.setObjectName("muted" if muted else "")
+                # Re-polish so #muted stylesheet applies without recreating the bar.
+                self._mic_bar.style().unpolish(self._mic_bar)
+                self._mic_bar.style().polish(self._mic_bar)
+        self._sync_mute_button(muted)
+        self._sync_body(st)
+        self._sync_tools(st)
 
-    def _sync_servos(self, st: Any) -> None:
-        if not self._servo_bars:
+    def _sync_tools(self, st: SimState) -> None:
+        view = self._tools_view
+        if view is None:
             return
-        angles = getattr(st, "servo_angles", None) or []
-        labels = getattr(st, "servo_labels", None) or []
-        span = _SERVO_DEG_MAX - _SERVO_DEG_MIN
-        for i in range(12):
-            key = self._servo_keys[i]
-            bar = self._servo_bars[i]
-            val = self._servo_vals[i]
-            label = labels[i] if i < len(labels) else f"S{i}"
-            if key.text() != label:
-                key.setText(label)
-            if i < len(angles):
-                deg = float(angles[i])
-                pct = int(max(0.0, min(1.0, (deg - _SERVO_DEG_MIN) / span)) * 100)
-                txt = f"{deg:+.0f}°"
-                if bar.value() != pct:
-                    bar.setValue(pct)
-                if val.text() != txt:
-                    val.setText(txt)
-            else:
-                if bar.value() != 0:
-                    bar.setValue(0)
-                if val.text() != "—":
-                    val.setText("—")
+        lines = st.tool_log
+        n = len(lines)
+        if n == self._tools_len:
+            return
+        self._tools_len = n
+        text = "\n".join(lines) if lines else ""
+        # Preserve manual scroll unless the user is already at the bottom.
+        bar = view.verticalScrollBar()
+        at_bottom = bar is None or bar.value() >= bar.maximum() - 4
+        view.setPlainText(text)
+        if at_bottom and bar is not None:
+            bar.setValue(bar.maximum())
+
+    def _sync_mute_button(self, muted: bool) -> None:
+        btn = self._mute_btn
+        if btn is None:
+            return
+        label = "Unmute mic  (Ctrl+M)" if muted else "Mute mic  (Ctrl+M)"
+        flag = "true" if muted else "false"
+        if btn.text() != label:
+            btn.setText(label)
+        if btn.property("muted") != flag:
+            btn.setProperty("muted", flag)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _sync_body(self, st: SimState) -> None:
+        view = self._body_view
+        if view is None:
+            return
+        view.set_pose(st.leg_coords)
 
     def _push_images(self) -> None:
         if self._face_dirty and self._face_label is not None:
@@ -397,6 +443,11 @@ class SimDashboard:
         self._input_fallback = ""
         if line and self.on_submit is not None:
             self.on_submit(line)
+
+    def toggle_mute(self) -> None:
+        """Dashboard Mute button / Ctrl+M — app handles state + audio abort."""
+        if self.on_mute_toggle is not None:
+            self.on_mute_toggle()
 
     def _on_close_event(self, event: Any) -> None:
         self._request_close()

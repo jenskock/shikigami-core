@@ -60,8 +60,8 @@ class EyesConfig:
     base_height: float = 1.0
     corner_radius: float = 0.85
     gap: float = 1.0
-    blink_rate_per_min: float = 18.0  # mean blinks / minute (Poisson λ)
-    double_blink_prob: float = 0.18
+    blink_rate_per_min: float = 8.0  # mean blinks / minute (Poisson λ)
+    double_blink_prob: float = 0.08
     gaze_wander: float = 0.35  # idle gaze wander amplitude
     saccade_amp: float = 0.04
     breath_amp: float = 0.025
@@ -94,16 +94,15 @@ class EyesConfig:
         cfg = EyesConfig(**{f: getattr(self, f) for f in self.__dataclass_fields__})
         p = self.personality.lower()
         if p == "curious":
-            cfg.blink_rate_per_min = max(cfg.blink_rate_per_min, 22.0)
             cfg.gaze_wander = max(cfg.gaze_wander, 0.45)
             cfg.saccade_amp = max(cfg.saccade_amp, 0.05)
         elif p == "calm":
-            cfg.blink_rate_per_min = min(cfg.blink_rate_per_min, 12.0)
+            cfg.blink_rate_per_min = min(cfg.blink_rate_per_min, 6.0)
             cfg.gaze_wander = min(cfg.gaze_wander, 0.2)
             cfg.breath_amp = max(cfg.breath_amp, 0.03)
         elif p == "mischievous":
-            cfg.blink_rate_per_min = max(cfg.blink_rate_per_min, 20.0)
-            cfg.double_blink_prob = max(cfg.double_blink_prob, 0.28)
+            cfg.blink_rate_per_min = min(cfg.blink_rate_per_min + 2.0, 12.0)
+            cfg.double_blink_prob = max(cfg.double_blink_prob, 0.15)
             cfg.gaze_wander = max(cfg.gaze_wander, 0.5)
         return cfg
 

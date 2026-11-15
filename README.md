@@ -10,13 +10,14 @@ expressive behavior, and LLM-driven reactions at low latency.
   webcam feed with face/cat boxes (faces drive gaze/`look_at` and emit
   `face_seen`/`face_lost`). Mac mic/speaker; motion commands are logged.
   Type in the terminal or in the dashboard chat field (Enter submits). Quit via the
-  **Quit** button, Esc, or the window close button.
+  **Quit** button, Esc, or the window close button. Mute the mic with **Mute mic**
+  or Ctrl+M.
   Ctrl-C in the terminal works too — blocking audio/network calls run on daemon
   threads, so even a stuck PortAudio call can't hang shutdown.
 - `pidog` / `picrawler` backends: thin wrappers over SunFounder's Python libs on the Pi.
   Those libs are imported **only inside their backend module**. On Mac, `picrawler` falls
-  back to SoftPicrawler (same `do_action`/`do_step` surface + IK/gaits, angles in the
-  dashboard SERVOS panel) so you can develop without GPIO.
+  back to SoftPicrawler (same `do_action`/`do_step` surface + IK/gaits, live stick body in
+  the dashboard BODY panel) so you can develop without GPIO.
 
 Backend is chosen via `SHIKIGAMI_BACKEND=sim|pidog|picrawler` (or `backend:` in
 `config/default.yaml`).
@@ -104,7 +105,8 @@ SHIKIGAMI_API_KEY=rqsty-sk-...
 STT is OpenAI-compatible `/audio/transcriptions`. For low latency, run Whisper on
 `jesktop` (`make setup-whisper`, default `Systran/faster-whisper-medium` on :8000) and
 point `STT_BASE_URL=http://jesktop:8000/v1`. Cloud fallback: Requesty voxtral.
-Dashboard shows `mic:` + level bar + `heard:`. Tune with `sim.vad_threshold` /
+Dashboard shows `mic:` + level bar + `heard:`. Mute with the **Mute mic** button or
+**Ctrl+M** (text chat still works). Tune with `sim.vad_threshold` /
 `sim.vad_silence_s` (default 0.5 s after speech). Each spoken turn logs `ttfa=…ms`
 (silence-end → first PCM). Mic errors fall back to text input.
 
@@ -153,8 +155,8 @@ SunFounder `do_action`/`do_step` (SoftPicrawler on Mac when libs are missing). I
 on the Pi: `pip install pidog robot_hat vilib` (or `picrawler ...`).
 
 ```bash
-uv run sim                 # SoftPicrawler + servo dashboard on Mac (config backend: picrawler)
-uv run sim --backend sim   # label-only sim HAL (no gait/servos)
+uv run sim                 # SoftPicrawler + BODY dashboard on Mac (config backend: picrawler)
+uv run sim --backend sim   # label-only sim HAL (no gait / body pose)
 ```
 
 ```bash

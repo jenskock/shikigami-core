@@ -56,6 +56,29 @@ def _resample_int16(pcm, src_sr: int, dst_sr: int, np):
     return np.clip(y, -32768, 32767).astype(np.int16)
 
 
+# Piper often hits int16 full-scale; leave headroom so CoreAudio resampling
+# / speaker DAC don't clip into crackle.
+_PLAY_PEAK_TARGET = 28000.0
+
+
+def _prepare_play_pcm(samples, channels: int, src_sr: int, dst_sr: int, np):
+    """Mono-ize if needed, resample to device rate, soft-limit near-clip peaks."""
+    pcm = np.asarray(samples, dtype=np.int16)
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+    else:
+        pcm = pcm.ravel()
+    pcm = _resample_int16(pcm, src_sr, dst_sr, np)
+    if pcm.size == 0:
+        return pcm
+    peak = float(np.max(np.abs(pcm)))
+    if peak > _PLAY_PEAK_TARGET:
+        pcm = np.clip(
+            pcm.astype(np.float32) * (_PLAY_PEAK_TARGET / peak), -32768, 32767
+        ).astype(np.int16)
+    return pcm
+
+
 class SimAudio(Audio):
     def __init__(
         self,
@@ -81,6 +104,11 @@ class SimAudio(Audio):
         self._device_logged = False
         self._speaker_logged = False
         self._pa_lock = threading.Lock()
+        self._muted = False
+
+    def set_muted(self, muted: bool) -> None:
+        """When True, abort the in-flight record loop ASAP (returns empty WAV)."""
+        self._muted = bool(muted)
 
     @classmethod
     def from_sim_config(cls, sim, log: logging.Logger | None = None, on_level=None) -> SimAudio:
@@ -162,6 +190,7 @@ class SimAudio(Audio):
         started = False
         calibrated = False
         peak = 0.0
+        aborted_mute = False
         t0 = time.monotonic()
         listen_s = min(max_s, self._vad_listen_s)
 
@@ -173,6 +202,11 @@ class SimAudio(Audio):
             blocksize=chunk,
         ) as stream:
             while time.monotonic() - t0 < max_s:
+                if self._muted:
+                    self._log.info("[sim] mic: muted — aborting capture")
+                    aborted_mute = True
+                    started = False
+                    break
                 block, _overflowed = stream.read(chunk)
                 if self._mic_gain != 1.0:
                     block = np.clip(
@@ -209,18 +243,19 @@ class SimAudio(Audio):
                     break
 
         if not started:
-            hint = (
-                " — mic looks dead (near-zero): grant Microphone permission to your "
-                "terminal in macOS System Settings > Privacy & Security, or set sim.mic_device"
-                if peak < 5
-                else " — speak louder, or lower sim.vad_threshold"
-            )
-            self._log.info(
-                "[sim] mic: no speech detected, peak rms %.0f (threshold %.0f)%s",
-                peak,
-                threshold,
-                hint,
-            )
+            if not aborted_mute:
+                hint = (
+                    " — mic looks dead (near-zero): grant Microphone permission to your "
+                    "terminal in macOS System Settings > Privacy & Security, or set sim.mic_device"
+                    if peak < 5
+                    else " — speak louder, or lower sim.vad_threshold"
+                )
+                self._log.info(
+                    "[sim] mic: no speech detected, peak rms %.0f (threshold %.0f)%s",
+                    peak,
+                    threshold,
+                    hint,
+                )
             if self._on_level is not None:
                 self._on_level(0.0)
             return b""
@@ -239,25 +274,29 @@ class SimAudio(Audio):
             self._log.warning("[sim] audio: cannot play format %r (%d bytes)", fmt, len(data))
             return
         with wave.open(io.BytesIO(data), "rb") as w:
-            sr = w.getframerate()
+            src_sr = w.getframerate()
             channels = w.getnchannels()
             raw = w.readframes(w.getnframes())
         samples = np.frombuffer(raw, dtype=np.int16)
-        if channels > 1:
-            samples = samples.reshape(-1, channels)
-        peak = int(np.max(np.abs(samples))) if samples.size else 0
         out = self._resolve_speaker(sd)
         self._log_speaker_once(sd, out)
+        info = sd.query_devices(out)
+        play_sr = int(info.get("default_samplerate") or src_sr)
+        src_peak = int(np.max(np.abs(samples))) if samples.size else 0
+        pcm = _prepare_play_pcm(samples, channels, src_sr, play_sr, np)
+        peak = int(np.max(np.abs(pcm))) if pcm.size else 0
 
         def _play() -> None:
             with self._pa_lock:
-                sd.play(samples, samplerate=sr, device=out, blocking=True)
+                sd.play(pcm, samplerate=play_sr, device=out, blocking=True)
                 time.sleep(_PA_SETTLE_S)
 
         self._log.info(
-            "[sim] speaker: playing %d samples @ %d Hz (peak %d) on #%d",
-            len(samples),
-            sr,
+            "[sim] speaker: playing %d samples @ %d Hz (from %d Hz peak %d→%d) on #%d",
+            len(pcm),
+            play_sr,
+            src_sr,
+            src_peak,
             peak,
             out,
         )

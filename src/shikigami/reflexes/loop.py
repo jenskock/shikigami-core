@@ -6,7 +6,10 @@ import asyncio
 import logging
 import time
 
+from ..app.bus import EventBus
 from ..config import ReflexConfig
+from ..hal.interfaces import HAL
+from ..perception.tracker import FaceTracker
 
 REACT_COOLDOWN_S = 2.0  # min time between touch/sound reactions, keeps the log readable
 
@@ -14,10 +17,10 @@ REACT_COOLDOWN_S = 2.0  # min time between touch/sound reactions, keeps the log 
 class ReflexLoop:
     def __init__(
         self,
-        hal,
-        bus,
+        hal: HAL,
+        bus: EventBus,
         cfg: ReflexConfig,
-        tracker=None,
+        tracker: FaceTracker | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self._hal = hal

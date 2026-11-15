@@ -20,8 +20,10 @@ from typing import Any
 
 from ..concurrency import run_detached
 from ..config import LLMConfig
+from ..memory.store import MemoryStore
 from ..personality.loader import Personality
 from .actions import TOOL_SCHEMAS, Action, SayAction, fake_message, parse_message, parse_tool_call
+from .prompts import build_system_prompt, build_user_message
 
 OnAction = Callable[[Action], Awaitable[None]]
 OnSentence = Callable[[str], Awaitable[None]]
@@ -55,7 +57,7 @@ class Brain:
         self,
         cfg: LLMConfig,
         personality: Personality,
-        memory: Any,
+        memory: MemoryStore,
         log: logging.Logger | None = None,
     ) -> None:
         self._cfg = cfg
@@ -99,9 +101,7 @@ class Brain:
 
     def build_messages(self, user_text: str, events: list, state: dict) -> list[dict[str, str]]:
         facts = [f"{f.key}: {f.value}" for f in self._memory.facts()]
-        mood = state.get("mood", "neutral")
-        from .prompts import build_system_prompt, build_user_message
-
+        mood = state["mood"]
         return [
             {"role": "system", "content": build_system_prompt(self._personality, mood, facts)},
             {"role": "user", "content": build_user_message(user_text, events, state)},

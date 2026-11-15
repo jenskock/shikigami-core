@@ -5,9 +5,23 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from types import SimpleNamespace
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, TypeAdapter
+
+
+class _ToolFunction(Protocol):
+    name: str
+    arguments: str | dict[str, Any]
+
+
+class _ToolCall(Protocol):
+    function: _ToolFunction
+
+
+class ChatMessage(Protocol):
+    tool_calls: list[_ToolCall] | None
+    content: str | None
 
 
 class ActionType(StrEnum):
@@ -177,7 +191,20 @@ def parse_tool_call(name: str, arguments: str | dict[str, Any]) -> Action:
     return ACTION_ADAPTER.validate_python({"type": name, **args})
 
 
-def parse_message(message: Any) -> list[Action]:
+def format_tool_call(action: Action, *, max_text: int = 80) -> str:
+    """Human-readable `name(arg=…)` line for logs / dashboard transparency."""
+    data = action.model_dump(exclude={"type"}, exclude_none=True)
+    parts: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, str):
+            text = value if len(value) <= max_text else value[: max_text - 1] + "…"
+            parts.append(f"{key}={text!r}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return f"{action.type.value}({', '.join(parts)})"
+
+
+def parse_message(message: ChatMessage) -> list[Action]:
     """Parse a chat-completion message (object with .tool_calls / .content) into actions.
 
     Plain text content with no tool calls becomes a single SayAction.
@@ -192,7 +219,7 @@ def parse_message(message: Any) -> list[Action]:
     return actions
 
 
-def fake_message(tool_calls: list[tuple[str, dict[str, Any]]], content: str = "") -> Any:
+def fake_message(tool_calls: list[tuple[str, dict[str, Any]]], content: str = "") -> ChatMessage:
     """Build a SimpleNamespace shaped like a chat completion message (tests/mock)."""
     return SimpleNamespace(
         tool_calls=[

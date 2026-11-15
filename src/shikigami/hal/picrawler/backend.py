@@ -116,7 +116,8 @@ class PicrawlerHAL(HAL):
         soft = not _HAS_PICRAWLER
         if soft:
             log.info("SunFounder picrawler not installed — using SoftPicrawler")
-            crawler: Any = SoftPicrawler(DEFAULT_PINS)
+            # ~45 ms/frame so gait frames are visible in the BODY panel.
+            crawler: Any = SoftPicrawler(DEFAULT_PINS, frame_delay_s=0.045)
             eyes_cfg = EyesConfig.from_mapping(cfg.eyes.model_dump()).apply_personality()
             self.state = SimState(backend="picrawler")
             dashboard = SimDashboard(enabled=cfg.sim.window or cfg.sim.camera_preview, log=log)
@@ -140,6 +141,11 @@ class PicrawlerHAL(HAL):
                 cfg.sim.window, self.state, dashboard, log, eyes_cfg=eyes_cfg
             )
             motion: Motion = PicrawlerMotion(crawler, log, state=self.state)
+            delay = crawler.frame_delay_s
+            crawler.frame_delay_s = 0.0
+            crawler.do_step("stand", 80)
+            motion._publish("stand")
+            crawler.frame_delay_s = delay
             super().__init__(
                 backend="picrawler",
                 motion=motion,

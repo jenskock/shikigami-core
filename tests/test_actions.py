@@ -14,6 +14,7 @@ from shikigami.brain.actions import (
     RememberAction,
     SayAction,
     fake_message,
+    format_tool_call,
     parse_message,
     parse_tool_call,
 )
@@ -82,3 +83,10 @@ def test_action_roundtrip():
     assert dumped["type"] == "move" and dumped["angle_deg"] == 90
     again = ACTION_ADAPTER.validate_python(dumped)
     assert again == a
+
+
+def test_format_tool_call():
+    assert format_tool_call(EmoteAction(name="happy")) == "emote(name='happy')"
+    assert "say(text=" in format_tool_call(SayAction(text="hi"))
+    long = format_tool_call(SayAction(text="x" * 100), max_text=20)
+    assert "…" in long and len(long) < 60

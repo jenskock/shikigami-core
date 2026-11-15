@@ -91,8 +91,8 @@ class EyesConfigModel(BaseModel):
     base_height: float = 1.0
     corner_radius: float = 0.85
     gap: float = 1.0
-    blink_rate_per_min: float = 18.0
-    double_blink_prob: float = 0.18
+    blink_rate_per_min: float = 8.0
+    double_blink_prob: float = 0.08
     gaze_wander: float = 0.35
     saccade_amp: float = 0.04
     breath_amp: float = 0.025
