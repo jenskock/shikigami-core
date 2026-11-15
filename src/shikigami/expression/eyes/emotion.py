@@ -99,9 +99,7 @@ def _presets() -> dict[Emotion, EmotionTarget]:
         Emotion.CURIOUS: _sym(
             _eye(width=0.96, height=1.18, corner=0.8, top=0.0, bottom=0.05), 1.06
         ),
-        Emotion.LOVE: _sym(
-            _eye(width=1.08, height=0.95, corner=0.92, top=0.1, bottom=0.28), 0.98
-        ),
+        Emotion.LOVE: _sym(_eye(width=1.08, height=0.95, corner=0.92, top=0.1, bottom=0.28), 0.98),
         Emotion.CONFUSED: EmotionTarget(
             left=_eye(width=0.98, height=1.05, top=0.12, bottom=0.1, angle=-8.0),
             right=_eye(width=1.05, height=1.15, top=0.02, bottom=0.05, angle=14.0),

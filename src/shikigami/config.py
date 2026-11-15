@@ -32,8 +32,23 @@ class STTConfig(BaseModel):
     enabled: bool = True
 
 
+TTSProvider = Literal["openai", "piper", "piper-http", "none"]
+VoiceTransport = Literal["sounddevice", "fake"]
+
+
+class VoiceConfig(BaseModel):
+    """Pipecat turn-taking. Silero replaces the old energy VAD."""
+
+    barge_in: bool = True
+    interrupt_while_moving: bool = False
+    smart_turn: bool = True
+    vad_confidence: float = 0.7
+    vad_stop_secs: float = 0.2  # Silero stop; keep this short when Smart Turn is on
+    transport: VoiceTransport = "sounddevice"
+
+
 class TTSConfig(BaseModel):
-    provider: str = "openai"  # openai | piper | piper-http | none
+    provider: TTSProvider = "piper-http"  # openai | piper | piper-http | none
     base_url: str = ""  # falls back to llm.base_url
     api_key: str = ""
     model: str = "gpt-4o-mini-tts"
@@ -109,6 +124,7 @@ class Config(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
     sim: SimConfig = Field(default_factory=SimConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     reflexes: ReflexConfig = Field(default_factory=ReflexConfig)
@@ -117,12 +133,24 @@ class Config(BaseModel):
     eyes: EyesConfigModel = Field(default_factory=EyesConfigModel)
 
 
+_TTS_PROVIDERS = ("openai", "piper", "piper-http", "none")
+_VOICE_TRANSPORTS = ("sounddevice", "fake")
+_TRUE = {"1", "true", "yes", "on"}
+
+
 def _env(*names: str) -> str | None:
     for n in names:
         v = os.environ.get(n)
         if v:
             return v
     return None
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return raw.strip().lower() in _TRUE
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -153,6 +181,8 @@ def load_config(path: str | Path | None = None) -> Config:
         cfg.stt.base_url = cfg.llm.base_url
 
     if v := _env("TTS_PROVIDER"):
+        if v not in _TTS_PROVIDERS:
+            raise ValueError(f"TTS_PROVIDER must be one of {_TTS_PROVIDERS}, got {v!r}")
         cfg.tts.provider = v
     if v := _env("TTS_BASE_URL"):
         cfg.tts.base_url = v
@@ -167,5 +197,18 @@ def load_config(path: str | Path | None = None) -> Config:
         cfg.tts.api_key = tts_key
     if not cfg.tts.base_url:
         cfg.tts.base_url = cfg.llm.base_url
+
+    if (flag := _env_bool("VOICE_BARGE_IN")) is not None:
+        cfg.voice.barge_in = flag
+    if (flag := _env_bool("VOICE_INTERRUPT_WHILE_MOVING")) is not None:
+        cfg.voice.interrupt_while_moving = flag
+    if (flag := _env_bool("VOICE_SMART_TURN")) is not None:
+        cfg.voice.smart_turn = flag
+    if v := _env("SHIKIGAMI_VOICE_TRANSPORT"):
+        if v not in _VOICE_TRANSPORTS:
+            raise ValueError(
+                f"SHIKIGAMI_VOICE_TRANSPORT must be one of {_VOICE_TRANSPORTS}, got {v!r}"
+            )
+        cfg.voice.transport = v
 
     return cfg

@@ -1,6 +1,5 @@
-"""Perception: VAD, face detection, face tracking. STT client lives in shikigami.voice."""
+"""Perception: face detection and face tracking. Turn-taking lives in the voice pipeline."""
 
 from .tracker import FaceTracker
-from .vad import EnergyVAD
 
-__all__ = ["EnergyVAD", "FaceTracker"]
+__all__ = ["FaceTracker"]

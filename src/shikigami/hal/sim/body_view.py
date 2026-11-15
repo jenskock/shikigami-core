@@ -136,9 +136,7 @@ def project_point(
     return (x_cam, z_cam)
 
 
-def to_screen(
-    pt: tuple[float, float], scale: float, ox: float, oy: float
-) -> tuple[float, float]:
+def to_screen(pt: tuple[float, float], scale: float, ox: float, oy: float) -> tuple[float, float]:
     return (ox + pt[0] * scale, oy - pt[1] * scale)
 
 

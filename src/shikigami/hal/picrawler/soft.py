@@ -30,6 +30,7 @@ GAIT_ACTIONS = (
     "turn right angle",
 )
 
+
 def _check_stand(func: Callable[..., list]) -> Callable[..., list]:
     def wrapper(self: MoveList) -> list:
         action: list = []

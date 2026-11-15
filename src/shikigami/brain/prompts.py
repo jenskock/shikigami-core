@@ -27,7 +27,16 @@ Facts you remember about your human:
 
 Each turn you receive recent events and your current state, then decide what to
 do using the tools: move, say, emote, remember, idle. Use 1-3 actions per turn.
-Always include at least one `say` or `emote` so your human can follow along."""
+Always include at least one `say` or `emote` so your human can follow along.
+Spoken words go only in the `say` tool. Do not also write them as plain text."""
+
+
+def build_situation(events: list[Event], state: dict) -> str:
+    """State and recent events for the live system message. The user text stays a user message."""
+    lines = [f"state: {json.dumps(state, default=str)}"]
+    for event in events:
+        lines.append(f"event: {event.kind} {json.dumps(event.payload, default=str)}")
+    return "\n".join(lines)
 
 
 def build_user_message(user_text: str, events: list[Event], state: dict) -> str:

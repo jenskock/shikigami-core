@@ -1,4 +1,1 @@
-from .stt import STTClient
-from .tts import TTSClient
-
-__all__ = ["STTClient", "TTSClient"]
+"""Pipecat speech pipeline: local audio, Silero, Smart Turn, STT, tools, TTS."""

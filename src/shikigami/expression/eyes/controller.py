@@ -163,8 +163,10 @@ class EyesEngine:
         left, right, gap = self.animator.step(dt)
 
         left, right = _apply_blink(left, right, blink.amount, blink.side)
-        breath = 1.0 + self.life.breath + reaction_fx.get("bounce", 0.0) * 0.08 * math.sin(
-            self._t * 14.0
+        breath = (
+            1.0
+            + self.life.breath
+            + reaction_fx.get("bounce", 0.0) * 0.08 * math.sin(self._t * 14.0)
         )
         left.scale *= breath
         right.scale *= breath

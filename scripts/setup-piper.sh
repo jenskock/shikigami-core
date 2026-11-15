@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Install piper-tts, download a (German) voice, start the Piper HTTP server, and self-test it.
+# This venv is separate from the app. shikigami posts JSON to the server and never
+# imports piper-tts, so the GPL-3.0 package stays in this process.
 # Run this on jesktop (as planned) or locally on the Mac — then point shikigami at it:
-# TTS_PROVIDER=piper-http, TTS_BASE_URL=http://jesktop:5000 (or http://localhost:5000).
+# TTS_PROVIDER=piper-http, TTS_BASE_URL=http://jesktop:5000 (or http://127.0.0.1:5000).
+# macOS AirPlay Receiver already binds port 5000; pass another port if `uv run sim` is local.
 #
 # Usage: scripts/setup-piper.sh [voice] [port]
 #   voice: e.g. de_DE-thorsten-medium (default), de_DE-ramona-medium, de_DE-karlsson-low (small/fast)

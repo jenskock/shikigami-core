@@ -23,8 +23,7 @@ class Cv2Renderer:
             self.height if out_bgr is None else out_bgr.shape[0],
             circular=False,
             out=self._rgb
-            if out_bgr is None
-            or self._rgb.shape[:2] == (out_bgr.shape[0], out_bgr.shape[1])
+            if out_bgr is None or self._rgb.shape[:2] == (out_bgr.shape[0], out_bgr.shape[1])
             else None,
         )
         if out_bgr is not None:

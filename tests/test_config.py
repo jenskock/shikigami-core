@@ -12,6 +12,12 @@ def test_load_default_config(monkeypatch):
     assert cfg.llm.max_tokens == 96  # hard cap: llm time ~= tokens generated
     assert cfg.sim.input == "mic"
     assert cfg.reflexes.hz >= 20
+    assert cfg.tts.provider == "piper-http"
+    assert cfg.tts.base_url == "http://jesktop:5000"
+    assert cfg.voice.barge_in is True
+    assert cfg.voice.interrupt_while_moving is False
+    assert cfg.voice.smart_turn is True
+    assert cfg.voice.transport == "sounddevice"
 
 
 def test_env_overrides_backend(monkeypatch):
@@ -27,8 +33,21 @@ def test_env_overrides_llm(monkeypatch):
     assert cfg.llm.base_url == "http://jesktop:11434/v1"
     assert cfg.llm.model == "qwen2.5:7b"
     assert cfg.llm.api_key == "sk-test"
-    # stt/tts fall back to the llm base url
+    # stt falls back to the llm base url; tts has its own piper-http default
     assert cfg.stt.base_url == "http://jesktop:11434/v1"
+    assert cfg.tts.base_url == "http://jesktop:5000"
+
+
+def test_voice_env_overrides(monkeypatch):
+    monkeypatch.setenv("VOICE_BARGE_IN", "false")
+    monkeypatch.setenv("VOICE_INTERRUPT_WHILE_MOVING", "yes")
+    monkeypatch.setenv("VOICE_SMART_TURN", "0")
+    monkeypatch.setenv("SHIKIGAMI_VOICE_TRANSPORT", "fake")
+    cfg = load_config()
+    assert cfg.voice.barge_in is False
+    assert cfg.voice.interrupt_while_moving is True
+    assert cfg.voice.smart_turn is False
+    assert cfg.voice.transport == "fake"
 
 
 def test_personality_loads():
