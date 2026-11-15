@@ -1,0 +1,58 @@
+# shikigami-core default configuration.
+# Override via environment variables / .env (see .env.example) or SHIKIGAMI_CONFIG=<path>.
+
+backend: sim # sim | pidog | picrawler — env SHIKIGAMI_BACKEND wins
+log_level: INFO
+
+llm:
+  # OpenAI-compatible router. Requesty is the default; local Ollama: http://jesktop:11434/v1
+  base_url: "https://router.requesty.ai/v1"
+  api_key: "" # or SHIKIGAMI_API_KEY / OPENAI_API_KEY in .env
+  model: "openai/gpt-4o-mini" # requesty uses provider-prefixed model names
+  temperature: 0.7
+  max_tokens: 96 # hard cap — llm time ~= tokens generated; replies are 1-2 sentences
+  timeout_s: 30
+  mock: false # true = canned reply, no network (dev/tests)
+
+stt:
+  base_url: "" # OpenAI-compatible /audio/transcriptions; defaults to llm.base_url when empty
+  api_key: ""
+  model: "mistral/voxtral-mini-latest" # requesty STT (or a local Whisper server on jesktop)
+  timeout_s: 30
+  enabled: false # sim default: type text instead of using the mic
+
+tts:
+  provider: "openai" # openai | piper | piper-http | none (piper-http: TTS_BASE_URL=http://jesktop:5000)
+  base_url: "" # defaults to llm.base_url when empty
+  api_key: ""
+  model: "openai/tts-1" # requesty TTS
+  voice: "alloy"
+  piper_voice: "" # path to .onnx voice for provider=piper
+  response_format: "wav" # keep wav: sounddevice cannot decode mp3
+  timeout_s: 30
+  enabled: true
+
+sim:
+  window: true # face/state window (needs the `sim` extra: opencv-python)
+  camera_preview: true # second window: webcam feed with face/cat detection boxes
+  camera_index: 0
+  fake_touch_prob: 0.0 # simulated "pat on the head" events per reflex tick (0 = off)
+  fake_sound_prob: 0.0 # simulated sound-direction events per reflex tick (0 = off)
+  mic_device: null # sounddevice device index, null = default
+  sample_rate: 16000
+  input: "text" # text | mic
+
+perception:
+  track_faces: true # camera: look at detected faces, publish face_seen/face_lost
+  face_cooldown_s: 2.0
+
+reflexes:
+  hz: 20 # fast local loop, no network
+  obstacle_cm: 25 # stop when something is closer than this
+  touch_react: true
+
+memory:
+  path: "data/memory.sqlite3"
+
+personality:
+  path: "config/personality.yaml"
