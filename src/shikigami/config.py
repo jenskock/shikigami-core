@@ -27,18 +27,20 @@ class STTConfig(BaseModel):
     base_url: str = ""  # falls back to llm.base_url
     api_key: str = ""
     model: str = "whisper-1"
+    language: str = ""  # optional ISO-639-1 or name (German/de); empty = auto-detect
     timeout_s: float = 30.0
-    enabled: bool = False
+    enabled: bool = True
 
 
 class TTSConfig(BaseModel):
-    provider: str = "openai"  # openai | piper | none
+    provider: str = "openai"  # openai | piper | piper-http | none
     base_url: str = ""  # falls back to llm.base_url
     api_key: str = ""
     model: str = "gpt-4o-mini-tts"
     voice: str = "alloy"
     piper_voice: str = ""
-    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "wav"
+    # WAV only — SimAudio.play (sounddevice) cannot decode mp3/opus/…
+    response_format: Literal["wav"] = "wav"
     timeout_s: float = 30.0
     enabled: bool = True
 
@@ -49,9 +51,16 @@ class SimConfig(BaseModel):
     camera_index: int = 0
     fake_touch_prob: float = 0.0  # per-tick probability of a simulated touch event
     fake_sound_prob: float = 0.0  # per-tick probability of a simulated sound event
+    vad_threshold: float = (
+        40.0  # minimum speech RMS (int16); auto-raised above noise floor while listening
+    )
+    vad_silence_s: float = 0.5  # silence after speech before the utterance ends
+    vad_listen_s: float = 3.0  # give up waiting for speech after this many seconds
     mic_device: int | None = None
-    sample_rate: int = 16000
-    input: str = "text"  # text | mic
+    speaker_device: int | None = None  # null = prefer MacBook speakers over external DACs
+    mic_gain: float = 8.0  # software gain on capture (MacBook mics are soft ~peak 200)
+    sample_rate: int = 16000  # WAV/STT rate; capture uses the device's native rate
+    input: str = "mic"  # text | mic
 
 
 class PerceptionConfig(BaseModel):
@@ -73,6 +82,27 @@ class PersonalityRef(BaseModel):
     path: str = "config/personality.yaml"
 
 
+class EyesConfigModel(BaseModel):
+    """Procedural eyes (expression.eyes) — color, blink rate, personality motion."""
+
+    color: tuple[int, int, int] = (255, 255, 255)
+    glow: float = 0.35
+    base_width: float = 1.0
+    base_height: float = 1.0
+    corner_radius: float = 0.85
+    gap: float = 1.0
+    blink_rate_per_min: float = 18.0
+    double_blink_prob: float = 0.18
+    gaze_wander: float = 0.35
+    saccade_amp: float = 0.04
+    breath_amp: float = 0.025
+    spring_omega: float = 14.0
+    gaze_spring_omega: float = 22.0
+    blink_spring_omega: float = 40.0
+    personality: str = "curious"  # curious | calm | mischievous
+    seed: int | None = None
+
+
 class Config(BaseModel):
     backend: str = Field(default="sim")  # sim | pidog | picrawler
     log_level: str = "INFO"
@@ -84,6 +114,7 @@ class Config(BaseModel):
     reflexes: ReflexConfig = Field(default_factory=ReflexConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     personality: PersonalityRef = Field(default_factory=PersonalityRef)
+    eyes: EyesConfigModel = Field(default_factory=EyesConfigModel)
 
 
 def _env(*names: str) -> str | None:

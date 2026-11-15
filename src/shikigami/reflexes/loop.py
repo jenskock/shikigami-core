@@ -65,10 +65,17 @@ class ReflexLoop:
                         "sound", {"direction_deg": round(reading.sound_direction_deg, 1)}
                     )
                     await self._hal.motion.look_at(reading.sound_direction_deg / 180.0, 0.0)
+                dash = getattr(self._hal, "dashboard", None)
+                if dash is not None:
+                    dash.pump()  # flush keystrokes before/around heavy work
                 await self._hal.expression.update(dt)
+                if dash is not None:
+                    dash.pump()
                 await self._hal.camera.preview_frame()
                 if self._tracker is not None:
                     await self._tracker.poll()
+                if dash is not None:
+                    dash.show()  # textures + stats; continuous pump is in dashboard
             except asyncio.CancelledError:
                 raise
             except Exception:

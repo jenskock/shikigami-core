@@ -1,8 +1,8 @@
-"""PiCrawler backend (SunFounder PiCrawler spider) — runs on the Raspberry Pi only.
+"""PiCrawler backend (SunFounder spider).
 
-SunFounder libraries are imported ONLY in this module. On a Mac the import
-fails and the constructor raises BackendUnavailable. Install on the Pi with:
-pip install picrawler robot_hat vilib (see https://docs.sunfounder.com).
+On a Raspberry Pi with SunFounder libs installed, uses the real ``picrawler``
+package. On Mac / missing libs, falls back to ``SoftPicrawler`` plus the sim
+camera/audio/expression/dashboard so development stays device-faithful.
 """
 
 from __future__ import annotations
@@ -10,9 +10,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from shikigami.expression.eyes.state import EyesConfig
+
 from ..errors import BackendUnavailable
 from ..interfaces import HAL, Camera, Expression, Motion, SensorReading, Sensors
-from ..sim.audio import SimAudio  # placeholder until a Pi audio HAT is wired
+from ..sim.audio import SimAudio
+from ..sim.camera import SimCamera
+from ..sim.dashboard import SimDashboard
+from ..sim.expression import SimExpression
+from ..sim.sensors import SimSensors
+from ..sim.state import SimState
+from .motion import PicrawlerMotion
+from .soft import SoftPicrawler
 
 try:  # guarded: only importable on a Pi with SunFounder libs installed
     from picrawler import Picrawler  # type: ignore
@@ -28,110 +37,134 @@ INSTALL_HINT = (
 )
 
 # default leg pin layout for PiCrawler (BCM); adjust for your wiring
-DEFAULT_PINS = [15, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-
-
-def _call_any(obj: Any, candidates: list[str], *args, **kwargs) -> Any:
-    for name in candidates:
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            return fn(*args, **kwargs)
-    raise NotImplementedError(
-        f"no known picrawler API among {candidates!r} — map it to the SunFounder docs here"
-    )
-
-
-class PicrawlerMotion(Motion):
-    def __init__(self, crawler: Any, log: logging.Logger) -> None:
-        self._c = crawler
-        self._log = log
-
-    async def walk(
-        self, direction: str = "forward", speed: float = 0.5, duration_s: float | None = None
-    ) -> None:
-        self._log.info("[picrawler] walk %s speed=%.2f", direction, speed)
-        raise NotImplementedError(
-            "map walk() to picrawler do_step/gait API (e.g. do_step([0,40,0]))"
-        )
-
-    async def turn(
-        self, direction: str = "left", angle_deg: float | None = None, speed: float = 0.5
-    ) -> None:
-        self._log.info("[picrawler] turn %s %s", direction, angle_deg)
-        raise NotImplementedError("map turn() to picrawler turn API")
-
-    async def sit(self) -> None:
-        raise NotImplementedError("spider has no sit; map to a lowered stance via do_step")
-
-    async def stand(self) -> None:
-        _call_any(
-            self._c,
-            ["stand", "reset"],
-        )
-
-    async def lie(self) -> None:
-        raise NotImplementedError("map lie() to a flat stance via do_step")
-
-    async def wag(self, duration_s: float | None = None) -> None:
-        raise NotImplementedError("spider has no tail; map to a little dance step")
-
-    async def look_at(self, x: float, y: float) -> None:
-        raise NotImplementedError("map look_at() to head servo if equipped")
-
-    async def stop(self) -> None:
-        _call_any(
-            self._c,
-            ["stop", "reset"],
-        )
-
-    async def play_action(self, name: str) -> None:
-        _call_any(self._c, ["do_action"], name)
+DEFAULT_PINS = SoftPicrawler.PIN_LIST
 
 
 class PicrawlerExpression(Expression):
-    def __init__(self, log: logging.Logger) -> None:
+    def __init__(self, log: logging.Logger, inner: Expression | None = None) -> None:
         self._log = log
+        self._inner = inner
 
-    async def start(self) -> None: ...
-    async def update(self, dt_s: float) -> None: ...
+    async def start(self) -> None:
+        if self._inner is not None:
+            await self._inner.start()
+
+    async def update(self, dt_s: float) -> None:
+        if self._inner is not None:
+            await self._inner.update(dt_s)
 
     async def emote(self, name: str) -> None:
         self._log.info("[picrawler] emote %s", name)
+        if self._inner is not None:
+            await self._inner.emote(name)
+            return
         raise NotImplementedError("map emote() to LED/buzzer via robot_hat")
 
     async def set_mood(self, mood: str) -> None:
         self._log.info("[picrawler] mood=%s", mood)
+        if self._inner is not None:
+            await self._inner.set_mood(mood)
 
-    async def speak_visual(self, active: bool) -> None: ...
-    async def stop(self) -> None: ...
+    async def speak_visual(self, active: bool) -> None:
+        if self._inner is not None:
+            await self._inner.speak_visual(active)
+
+    async def stop(self) -> None:
+        if self._inner is not None:
+            await self._inner.stop()
 
 
 class PicrawlerSensors(Sensors):
+    def __init__(self, inner: Sensors | None = None) -> None:
+        self._inner = inner
+
     async def read(self) -> SensorReading:
+        if self._inner is not None:
+            return await self._inner.read()
         raise NotImplementedError("map SensorReading to picrawler ultrasonic/IMU")
 
 
 class PicrawlerCamera(Camera):
+    def __init__(self, inner: Camera | None = None) -> None:
+        self._inner = inner
+
     async def start(self) -> None:
+        if self._inner is not None:
+            await self._inner.start()
+            return
         raise NotImplementedError("use vilib camera on the Pi")
 
     async def read_frame(self) -> Any | None:
+        if self._inner is not None:
+            return await self._inner.read_frame()
         raise NotImplementedError("use vilib camera on the Pi")
 
-    async def stop(self) -> None: ...
+    async def preview_frame(self) -> None:
+        if self._inner is not None:
+            await self._inner.preview_frame()
+
+    async def stop(self) -> None:
+        if self._inner is not None:
+            await self._inner.stop()
 
 
 class PicrawlerHAL(HAL):
+    """Real Picrawler on Pi; SoftPicrawler + sim chrome when libs are missing."""
+
     def __init__(self, cfg) -> None:
-        if not _HAS_PICRAWLER:
-            raise BackendUnavailable(INSTALL_HINT)
         log = logging.getLogger("shikigami.picrawler")
-        crawler = Picrawler(DEFAULT_PINS)
+        soft = not _HAS_PICRAWLER
+        if soft:
+            log.info("SunFounder picrawler not installed — using SoftPicrawler")
+            crawler: Any = SoftPicrawler(DEFAULT_PINS)
+            eyes_cfg = EyesConfig.from_mapping(cfg.eyes.model_dump()).apply_personality()
+            self.state = SimState(backend="picrawler")
+            dashboard = SimDashboard(enabled=cfg.sim.window or cfg.sim.camera_preview, log=log)
+            dashboard.state = self.state
+            self.dashboard = dashboard
+            camera: Camera = SimCamera(
+                cfg.sim.camera_index,
+                preview=cfg.sim.camera_preview,
+                dashboard=dashboard,
+                log=log,
+            )
+            audio = SimAudio.from_sim_config(
+                cfg.sim,
+                log=log,
+                on_level=lambda n: setattr(self.state, "mic_level", n),
+            )
+            sensors: Sensors = SimSensors(
+                touch_prob=cfg.sim.fake_touch_prob, sound_prob=cfg.sim.fake_sound_prob
+            )
+            expression: Expression = SimExpression(
+                cfg.sim.window, self.state, dashboard, log, eyes_cfg=eyes_cfg
+            )
+            motion: Motion = PicrawlerMotion(crawler, log, state=self.state)
+            super().__init__(
+                backend="picrawler",
+                motion=motion,
+                camera=camera,
+                audio=audio,
+                sensors=sensors,
+                expression=expression,
+            )
+            return
+
+        # Real device path
+        assert Picrawler is not None
+        try:
+            crawler = Picrawler(DEFAULT_PINS)
+        except Exception as exc:  # pragma: no cover - Pi hardware
+            raise BackendUnavailable(f"{INSTALL_HINT} ({exc})") from exc
+
+        self.state = None
+        self.dashboard = None
+        motion = PicrawlerMotion(crawler, log, state=None)
         super().__init__(
             backend="picrawler",
-            motion=PicrawlerMotion(crawler, log),
+            motion=motion,
             camera=PicrawlerCamera(),
-            audio=SimAudio(cfg.sim.sample_rate, cfg.sim.mic_device, log),  # TODO: Pi mic/speaker
+            audio=SimAudio.from_sim_config(cfg.sim, log=log),
             sensors=PicrawlerSensors(),
             expression=PicrawlerExpression(log),
         )

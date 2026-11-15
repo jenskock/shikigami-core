@@ -1,12 +1,12 @@
-.PHONY: sync run-sim test lint fmt deploy
+.PHONY: sync run-sim test lint fmt deploy setup-piper setup-whisper
 
 UV ?= uv
 
-sync: ## create venv + lockfile-resolved deps (incl. sim extra for the face window)
-	$(UV) sync --extra sim
+sync: ## create venv + deps (incl. face/mic/speaker)
+	$(UV) sync
 
-run-sim: ## run the simulator backend on this Mac
-	$(UV) run --extra sim shikigami --backend sim
+run-sim: ## Mac buddy: dashboard + mic
+	$(UV) run sim
 
 test: ## unit tests (no camera/mic/network needed)
 	$(UV) run pytest
@@ -23,3 +23,7 @@ deploy: ## rsync code to the Pi (placeholder; set DEPLOY_HOST in .env)
 
 setup-piper: ## install piper-tts + German voice, start the TTS server (on jesktop or locally)
 	bash scripts/setup-piper.sh
+
+setup-whisper: ## install faster-whisper-server, start OpenAI-compatible STT on :8000 (on jesktop)
+	bash scripts/setup-whisper.sh
+

@@ -1,17 +1,19 @@
-"""Sim audio = Mac mic/speaker via sounddevice (lazy import).
-
-record() returns 16-bit mono WAV bytes ready for an STT endpoint.
-"""
+"""Sim audio: Mac mic/speaker via sounddevice (lazy import)."""
 
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
+import threading
 import time
 import wave
 
+from ...concurrency import run_detached
 from ..interfaces import Audio
+
+_LEVEL_REF_RMS = 250.0
+_CALIBRATE_CHUNKS = 5
+_PA_SETTLE_S = 0.12
 
 
 def _require_audio():
@@ -38,48 +40,198 @@ def _to_wav(pcm, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def _resample_int16(pcm, src_sr: int, dst_sr: int, np):
+    """Linear resample mono int16 PCM. No-op when rates match."""
+    if src_sr == dst_sr:
+        return np.asarray(pcm, dtype=np.int16).ravel()
+    x = np.asarray(pcm, dtype=np.float32).ravel()
+    if x.size == 0:
+        return np.zeros(0, dtype=np.int16)
+    n_dst = int(round(x.size * dst_sr / src_sr))
+    if n_dst <= 0:
+        return np.zeros(0, dtype=np.int16)
+    t_src = np.linspace(0.0, 1.0, num=x.size, endpoint=False)
+    t_dst = np.linspace(0.0, 1.0, num=n_dst, endpoint=False)
+    y = np.interp(t_dst, t_src, x)
+    return np.clip(y, -32768, 32767).astype(np.int16)
+
+
 class SimAudio(Audio):
     def __init__(
         self,
         sample_rate: int = 16000,
         mic_device: int | None = None,
+        speaker_device: int | None = None,
+        vad_threshold: float = 40.0,
+        vad_silence_s: float = 1.0,
+        vad_listen_s: float = 3.0,
+        mic_gain: float = 8.0,
+        on_level=None,
         log: logging.Logger | None = None,
     ) -> None:
         self._sr = sample_rate
         self._device = mic_device
+        self._speaker_device = speaker_device
+        self._vad_threshold = vad_threshold
+        self._vad_silence_s = vad_silence_s
+        self._vad_listen_s = vad_listen_s
+        self._mic_gain = max(1.0, float(mic_gain))
+        self._on_level = on_level
         self._log = log or logging.getLogger("shikigami.sim.audio")
+        self._device_logged = False
+        self._speaker_logged = False
+        self._pa_lock = threading.Lock()
 
-    async def record(self, max_s: float = 8.0, silence_s: float = 1.2) -> bytes:
+    @classmethod
+    def from_sim_config(cls, sim, log: logging.Logger | None = None, on_level=None) -> SimAudio:
+        """Build from Config.sim — keeps sim / pidog / picrawler backends in sync."""
+        return cls(
+            sample_rate=sim.sample_rate,
+            mic_device=sim.mic_device,
+            speaker_device=sim.speaker_device,
+            vad_threshold=sim.vad_threshold,
+            vad_silence_s=sim.vad_silence_s,
+            vad_listen_s=sim.vad_listen_s,
+            mic_gain=sim.mic_gain,
+            on_level=on_level,
+            log=log,
+        )
+
+    def _resolve_device(self, sd) -> int:
+        if self._device is not None:
+            return int(self._device)
+        info = sd.query_devices(kind="input")
+        return int(info["index"])
+
+    def _resolve_speaker(self, sd) -> int:
+        """Prefer built-in Mac speakers over external DACs (often silent when idle)."""
+        if self._speaker_device is not None:
+            return int(self._speaker_device)
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_output_channels"] <= 0:
+                continue
+            name = d["name"].lower()
+            if "macbook" in name and ("lautsprecher" in name or "speaker" in name):
+                return i
+        info = sd.query_devices(kind="output")
+        return int(info["index"])
+
+    def _log_device_once(self, sd, device: int, capture_sr: int) -> None:
+        if self._device_logged:
+            return
+        self._device_logged = True
+        info = sd.query_devices(device)
+        self._log.info(
+            "[sim] mic: input device #%d %r (native %d Hz → wav %d Hz)",
+            device,
+            info["name"],
+            capture_sr,
+            self._sr,
+        )
+
+    def _log_speaker_once(self, sd, device: int) -> None:
+        if self._speaker_logged:
+            return
+        self._speaker_logged = True
+        info = sd.query_devices(device)
+        self._log.info("[sim] speaker: output device #%d %r", device, info["name"])
+
+    def _record_sync(self, max_s: float, silence_s: float) -> bytes:
+        """Blocking capture: one InputStream for the whole utterance (no per-chunk open)."""
+        sd, np = _require_audio()
+        with self._pa_lock:
+            time.sleep(_PA_SETTLE_S)
+            try:
+                return self._record_locked(sd, np, max_s, silence_s)
+            finally:
+                time.sleep(_PA_SETTLE_S)
+
+    def _record_locked(self, sd, np, max_s: float, silence_s: float) -> bytes:
         from ...perception.vad import EnergyVAD
 
-        sd, np = _require_audio()
-        chunk = int(self._sr * 0.1)  # 100 ms blocks
-        vad = EnergyVAD(silence_s=silence_s)
+        device = self._resolve_device(sd)
+        info = sd.query_devices(device)
+        capture_sr = int(info["default_samplerate"])
+        self._log_device_once(sd, device, capture_sr)
+
+        chunk = max(1, int(capture_sr * 0.1))  # ~100 ms blocks at native rate
+        threshold = self._vad_threshold
+        vad = EnergyVAD(threshold=threshold, silence_s=silence_s)
         frames: list = []
+        noise_rms: list[float] = []
         started = False
+        calibrated = False
+        peak = 0.0
         t0 = time.monotonic()
+        listen_s = min(max_s, self._vad_listen_s)
 
-        def _rec() -> bytes:
-            block = sd.rec(
-                chunk, samplerate=self._sr, channels=1, dtype="int16", device=self._device
+        with sd.InputStream(
+            samplerate=capture_sr,
+            channels=1,
+            dtype="int16",
+            device=device,
+            blocksize=chunk,
+        ) as stream:
+            while time.monotonic() - t0 < max_s:
+                block, _overflowed = stream.read(chunk)
+                if self._mic_gain != 1.0:
+                    block = np.clip(
+                        block.astype(np.float32) * self._mic_gain, -32768, 32767
+                    ).astype(np.int16)
+                rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
+                peak = max(peak, rms)
+                if self._on_level is not None:
+                    self._on_level(min(1.0, rms / _LEVEL_REF_RMS))
+                frames.append(block)
+
+                if not calibrated:
+                    noise_rms.append(rms)
+                    if len(noise_rms) >= _CALIBRATE_CHUNKS:
+                        floor = float(np.percentile(noise_rms, 25))
+                        threshold = max(self._vad_threshold, floor * 4.0, floor + 20.0)
+                        vad.threshold = threshold
+                        calibrated = True
+                        self._log.info(
+                            "[sim] mic: noise floor %.0f → threshold %.0f", floor, threshold
+                        )
+                    continue
+
+                state = vad.feed(rms, dt_s=0.1)
+                if state == "speech_start":
+                    started = True
+                    self._log.info("[sim] mic: speech started (threshold %.0f)", threshold)
+                elif state == "silence":
+                    started = False
+                if started and state == "speech_end":
+                    self._log.info("[sim] mic: speech ended — peak rms %.0f", peak)
+                    break
+                if not started and (time.monotonic() - t0) >= listen_s:
+                    break
+
+        if not started:
+            hint = (
+                " — mic looks dead (near-zero): grant Microphone permission to your "
+                "terminal in macOS System Settings > Privacy & Security, or set sim.mic_device"
+                if peak < 5
+                else " — speak louder, or lower sim.vad_threshold"
             )
-            sd.wait()
-            return block
+            self._log.info(
+                "[sim] mic: no speech detected, peak rms %.0f (threshold %.0f)%s",
+                peak,
+                threshold,
+                hint,
+            )
+            if self._on_level is not None:
+                self._on_level(0.0)
+            return b""
 
-        while time.monotonic() - t0 < max_s:
-            block = await asyncio.to_thread(_rec)
-            rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
-            state = vad.feed(rms, dt_s=0.1)
-            if state == "speech_start":
-                started = True
-                self._log.info("[sim] mic: speech started")
-            frames.append(block)
-            if started and state == "speech_end":
-                self._log.info("[sim] mic: speech ended (silence)")
-                break
-
-        pcm = np.concatenate(frames) if frames else np.zeros(0, dtype=np.int16)
+        pcm = np.concatenate(frames).ravel()
+        pcm = _resample_int16(pcm, capture_sr, self._sr, np)
         return _to_wav(pcm, self._sr)
+
+    async def record(self, max_s: float = 8.0, silence_s: float | None = None) -> bytes:
+        sil = self._vad_silence_s if silence_s is None else silence_s
+        return await run_detached(lambda: self._record_sync(max_s, sil))
 
     async def play(self, data: bytes, fmt: str = "wav") -> None:
         sd, np = _require_audio()
@@ -93,10 +245,20 @@ class SimAudio(Audio):
         samples = np.frombuffer(raw, dtype=np.int16)
         if channels > 1:
             samples = samples.reshape(-1, channels)
+        peak = int(np.max(np.abs(samples))) if samples.size else 0
+        out = self._resolve_speaker(sd)
+        self._log_speaker_once(sd, out)
 
         def _play() -> None:
-            sd.play(samples, samplerate=sr)
-            sd.wait()
+            with self._pa_lock:
+                sd.play(samples, samplerate=sr, device=out, blocking=True)
+                time.sleep(_PA_SETTLE_S)
 
-        self._log.info("[sim] speaker: playing %d samples @ %d Hz", len(samples), sr)
-        await asyncio.to_thread(_play)
+        self._log.info(
+            "[sim] speaker: playing %d samples @ %d Hz (peak %d) on #%d",
+            len(samples),
+            sr,
+            peak,
+            out,
+        )
+        await run_detached(_play)

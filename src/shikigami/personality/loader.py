@@ -12,6 +12,7 @@ class Personality(BaseModel):
     name: str
     character: str
     voice: str = ""
+    language: str = "English"  # the LLM always replies in this language (match your TTS voice)
     rules: list[str] = Field(default_factory=list)
     greeting: str = ""
 

@@ -11,3 +11,11 @@ class SimState:
         self.last_heard: str = ""
         self.last_latency: str = ""
         self.status: str = "idle"
+        self.mic: str = ""
+        self.mic_level: float = 0.0
+        self.gaze_x: float = 0.0  # -1..1, drives eye look (from look_at / face tracker)
+        self.gaze_y: float = 0.0
+        # Body / servo telemetry (picrawler soft or real, when published by Motion).
+        self.servo_angles: list[float] = []
+        self.servo_labels: list[str] = []
+        self.leg_coords: list[list[float]] = []

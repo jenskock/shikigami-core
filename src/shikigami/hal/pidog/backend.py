@@ -134,7 +134,7 @@ class PiDogHAL(HAL):
             backend="pidog",
             motion=PiDogMotion(dog, log),
             camera=PiDogCamera(),
-            audio=SimAudio(cfg.sim.sample_rate, cfg.sim.mic_device, log),  # TODO: Pi mic/speaker
+            audio=SimAudio.from_sim_config(cfg.sim, log=log),  # TODO: Pi mic/speaker HAT
             sensors=PiDogSensors(dog),
             expression=PiDogExpression(dog, log),
         )

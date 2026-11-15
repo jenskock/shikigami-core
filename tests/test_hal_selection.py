@@ -58,8 +58,17 @@ def test_pidog_backend_guarded_when_libs_missing():
         create_hal("pidog", load_config())
 
 
-def test_picrawler_backend_guarded_when_libs_missing():
-    if "picrawler" in sys.modules:
+def test_picrawler_backend_soft_fallback_when_libs_missing():
+    """Without SunFounder libs, picrawler uses SoftPicrawler (Mac-friendly)."""
+    from shikigami.hal.picrawler import backend as be
+    from shikigami.hal.picrawler.backend import PicrawlerHAL
+
+    if be._HAS_PICRAWLER:
         pytest.skip("picrawler lib present on this host")
-    with pytest.raises(BackendUnavailable, match="SunFounder"):
-        create_hal("picrawler", load_config())
+    cfg = load_config()
+    cfg.sim.window = False
+    cfg.sim.camera_preview = False
+    hal = create_hal("picrawler", cfg)
+    assert isinstance(hal, PicrawlerHAL)
+    assert hal.backend == "picrawler"
+    assert hal.state is not None

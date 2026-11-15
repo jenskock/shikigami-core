@@ -11,15 +11,13 @@ dependencies = [
     "openai>=1.35",
     "httpx>=0.27",
     "python-dotenv>=1.0",
-]
-
-# Heavy / machine-specific deps live only in the `sim` extra (macOS dev machine).
-# The Pi backends need SunFounder libs, installed on the Pi itself, never here.
-[project.optional-dependencies]
-sim = [
+    # Mac sim HAL (face/mic/speaker). Harmless on the Pi until a native HAL replaces them.
     "numpy>=1.26",
-    "opencv-python>=4.9,<5",  # OpenCV 5.x moved/removed CascadeClassifier; we target the 4.x API
+    "opencv-python>=4.9,<5",
     "sounddevice>=0.5",
+    "pillow>=10.0",
+    "pygame>=2.5",
+    "pyside6-essentials>=6.6",  # sim dashboard (Qt)
 ]
 
 [dependency-groups]
@@ -30,6 +28,9 @@ dev = [
 
 [project.scripts]
 shikigami = "shikigami.__main__:main"
+sim = "shikigami.__main__:main_sim"
+eyes-demo = "shikigami.expression.eyes.demo:main"
+eyes-bench = "shikigami.expression.eyes.benchmark:main"
 
 [build-system]
 requires = ["hatchling"]

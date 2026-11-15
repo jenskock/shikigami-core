@@ -1,7 +1,7 @@
 # shikigami-core default configuration.
 # Override via environment variables / .env (see .env.example) or SHIKIGAMI_CONFIG=<path>.
 
-backend: sim # sim | pidog | picrawler — env SHIKIGAMI_BACKEND wins
+backend: picrawler # sim | pidog | picrawler — SoftPicrawler on Mac; env SHIKIGAMI_BACKEND wins
 log_level: INFO
 
 llm:
@@ -17,9 +17,9 @@ llm:
 stt:
   base_url: "" # OpenAI-compatible /audio/transcriptions; defaults to llm.base_url when empty
   api_key: ""
-  model: "mistral/voxtral-mini-latest" # requesty STT (or a local Whisper server on jesktop)
+  model: "mistral/voxtral-mini-latest" # requesty STT; local: Systran/faster-whisper-medium via make setup-whisper
   timeout_s: 30
-  enabled: false # sim default: type text instead of using the mic
+  enabled: true # mic on by default for `uv run sim`; --text-input to type instead
 
 tts:
   provider: "openai" # openai | piper | piper-http | none (piper-http: TTS_BASE_URL=http://jesktop:5000)
@@ -28,19 +28,24 @@ tts:
   model: "openai/tts-1" # requesty TTS
   voice: "alloy"
   piper_voice: "" # path to .onnx voice for provider=piper
-  response_format: "wav" # keep wav: sounddevice cannot decode mp3
+  response_format: "wav" # WAV only — sim playback cannot decode mp3/opus/…
   timeout_s: 30
   enabled: true
 
 sim:
-  window: true # face/state window (needs the `sim` extra: opencv-python)
+  window: true # face/state window (opencv)
   camera_preview: true # second window: webcam feed with face/cat detection boxes
   camera_index: 0
   fake_touch_prob: 0.0 # simulated "pat on the head" events per reflex tick (0 = off)
   fake_sound_prob: 0.0 # simulated sound-direction events per reflex tick (0 = off)
-  mic_device: null # sounddevice device index, null = default
-  sample_rate: 16000
-  input: "text" # text | mic
+  vad_threshold: 40.0 # min speech RMS (int16); auto-raised above noise floor (~MacBook speech is 80–250)
+  vad_silence_s: 0.5 # silence after speech before the utterance is sent to STT
+  vad_listen_s: 3.0 # give up (no STT) if no speech starts within this many seconds
+  mic_device: null # sounddevice device index, null = default input
+  speaker_device: null # null = prefer MacBook speakers (avoids silent external DACs like D10s)
+  mic_gain: 8.0 # software gain on capture (MacBook speech is often only peak ~150–400)
+  sample_rate: 16000 # WAV/STT rate; capture uses the device's native rate (often 48 kHz)
+  input: "mic" # text | mic
 
 perception:
   track_faces: true # camera: look at detected faces, publish face_seen/face_lost
@@ -56,3 +61,14 @@ memory:
 
 personality:
   path: "config/personality.yaml"
+
+# Procedural eyes (expression.eyes) — local motion; LLM only sends emote names.
+eyes:
+  color: [255, 255, 255] # RGB white (Cozmo / RoboEyes-ish)
+  glow: 0.35
+  corner_radius: 0.85
+  blink_rate_per_min: 18.0
+  double_blink_prob: 0.18
+  gaze_wander: 0.35
+  personality: curious # curious | calm | mischievous — tunes blink/wander
+  seed: null # set an int for deterministic tests / replay

@@ -20,7 +20,7 @@ class ActionType(StrEnum):
 
 class MoveAction(BaseModel):
     type: Literal[ActionType.MOVE] = ActionType.MOVE
-    motion: str = "walk"  # walk|turn|sit|stand|lie|wag|look_at|stop|<named action>
+    motion: str = "walk"  # walk|turn|sit|stand|lie|wag|look_at|stop|dance|wave|…
     direction: str = "forward"  # forward|back|left|right
     speed: float = 0.5
     duration_s: float | None = None
@@ -67,7 +67,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "motion": {
                         "type": "string",
-                        "enum": ["walk", "turn", "sit", "stand", "lie", "wag", "look_at", "stop"],
+                        "enum": [
+                            "walk",
+                            "turn",
+                            "sit",
+                            "stand",
+                            "lie",
+                            "wag",
+                            "look_at",
+                            "stop",
+                            # Picrawler / SunFounder named actions (via play_action)
+                            "dance",
+                            "wave",
+                            "push_up",
+                            "forward",
+                            "backward",
+                            "turn_left",
+                            "turn_right",
+                        ],
+                        "description": (
+                            "High-level body verb, or a named gait/action "
+                            "(dance/wave/push_up/…) when the backend supports it."
+                        ),
                     },
                     "direction": {"type": "string", "enum": ["forward", "back", "left", "right"]},
                     "speed": {"type": "number", "minimum": 0, "maximum": 1},
@@ -100,7 +121,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "name": {
                         "type": "string",
-                        "enum": ["neutral", "happy", "curious", "surprised", "sad", "sleepy"],
+                        "enum": [
+                            "neutral",
+                            "happy",
+                            "sad",
+                            "angry",
+                            "surprised",
+                            "sleepy",
+                            "curious",
+                            "love",
+                            "confused",
+                            "scared",
+                            "focused",
+                            "mischievous",
+                        ],
                     }
                 },
                 "required": ["name"],

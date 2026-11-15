@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ class TTSClient:
         self._piper_path: str | None = (
             None  # discovered once: /api/tts (1.3.x) vs /synthesize (>=1.8)
         )
+        self._piper_lock = threading.Lock()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -50,25 +52,37 @@ class TTSClient:
             return self._synth_piper(text), "wav"
         if self._cfg.provider == "piper-http":
             return self._synth_piper_http(text), "wav"
-        return self._synth_openai(text), self._cfg.response_format
+        return self._synth_openai(text), "wav"
 
     def _synth_piper_http(self, text: str) -> bytes:
         import httpx
 
         base = self._cfg.base_url.rstrip("/")
-        if self._piper_path is None:
-            for path in ("/api/tts", "/synthesize"):
-                resp = httpx.post(base + path, json={"text": text}, timeout=self._cfg.timeout_s)
-                if resp.status_code != 404:
-                    self._piper_path = path
-                    break
-            else:
+        payload = {"text": text}
+        with self._piper_lock:
+            if self._piper_path is None:
+                # probe once; reuse the successful response so we don't synth twice
+                for path in ("/api/tts", "/synthesize"):
+                    resp = httpx.post(
+                        base + path, json=payload, timeout=self._cfg.timeout_s
+                    )
+                    if resp.status_code != 404:
+                        self._piper_path = path
+                        resp.raise_for_status()
+                        self._log.info(
+                            "tts(piper-http %s): %d chars -> %d bytes",
+                            path,
+                            len(text),
+                            len(resp.content),
+                        )
+                        return resp.content
                 raise RuntimeError(f"no TTS endpoint found on piper server at {base}")
-        resp = httpx.post(base + self._piper_path, json={"text": text}, timeout=self._cfg.timeout_s)
+            path = self._piper_path
+        resp = httpx.post(base + path, json=payload, timeout=self._cfg.timeout_s)
         resp.raise_for_status()
         self._log.info(
             "tts(piper-http %s): %d chars -> %d bytes",
-            self._piper_path,
+            path,
             len(text),
             len(resp.content),
         )
@@ -76,11 +90,12 @@ class TTSClient:
 
     def _synth_openai(self, text: str) -> bytes:
         client = self._get_client()
+        # always request WAV — config is Literal["wav"] and sim playback needs it
         resp = client.audio.speech.create(
             model=self._cfg.model,
             voice=self._cfg.voice,
             input=text,
-            response_format=self._cfg.response_format,
+            response_format="wav",
         )
         data = resp.content
         self._log.info("tts(openai): %d chars -> %d bytes", len(text), len(data))

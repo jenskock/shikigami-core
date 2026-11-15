@@ -1,6 +1,8 @@
 """TTS providers: piper-http posts to the remote Piper server; none disables."""
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
 from shikigami.config import TTSConfig
 from shikigami.voice.tts import TTSClient
@@ -52,3 +54,26 @@ def test_piper_http_legacy_api_tts_1_3(monkeypatch):
 def test_none_provider_returns_empty():
     tts = TTSClient(TTSConfig(provider="none"))
     assert tts.synth("hi") == (b"", "none")
+
+
+def test_response_format_rejects_non_wav():
+    with pytest.raises(ValidationError):
+        TTSConfig(response_format="mp3")
+
+
+def test_openai_synth_always_requests_wav(monkeypatch):
+    seen = {}
+
+    class _Speech:
+        def create(self, **kw):
+            seen.update(kw)
+            return type("R", (), {"content": b"RIFF"})()
+
+    class _Client:
+        audio = type("A", (), {"speech": _Speech()})()
+
+    tts = TTSClient(TTSConfig(provider="openai", model="tts-1", voice="alloy"))
+    monkeypatch.setattr(tts, "_get_client", lambda: _Client())
+    data, fmt = tts.synth("hi")
+    assert data == b"RIFF" and fmt == "wav"
+    assert seen["response_format"] == "wav"

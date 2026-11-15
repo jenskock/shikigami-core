@@ -4,18 +4,19 @@ from shikigami.config import REPO_ROOT, load_config
 from shikigami.personality.loader import load_personality
 
 
-def test_load_default_config():
+def test_load_default_config(monkeypatch):
+    monkeypatch.delenv("SHIKIGAMI_BACKEND", raising=False)
     cfg = load_config()
-    assert cfg.backend == "sim"
+    assert cfg.backend == "picrawler"
     assert cfg.llm.model
     assert cfg.llm.max_tokens == 96  # hard cap: llm time ~= tokens generated
-    assert cfg.sim.input == "text"
+    assert cfg.sim.input == "mic"
     assert cfg.reflexes.hz >= 20
 
 
 def test_env_overrides_backend(monkeypatch):
-    monkeypatch.setenv("SHIKIGAMI_BACKEND", "picrawler")
-    assert load_config().backend == "picrawler"
+    monkeypatch.setenv("SHIKIGAMI_BACKEND", "sim")
+    assert load_config().backend == "sim"
 
 
 def test_env_overrides_llm(monkeypatch):
@@ -34,4 +35,5 @@ def test_personality_loads():
     p = load_personality(REPO_ROOT / "config" / "personality.yaml")
     assert p.name == "Shikigami"
     assert p.character
+    assert p.language == "German"  # matches the de_DE piper voice
     assert len(p.rules) >= 3

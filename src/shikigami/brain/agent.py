@@ -12,11 +12,13 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..concurrency import run_detached
 from ..config import LLMConfig
 from ..personality.loader import Personality
 from .actions import TOOL_SCHEMAS, Action, SayAction, fake_message, parse_message, parse_tool_call
@@ -84,11 +86,12 @@ class Brain:
         try:
             client = self._get_client()
             t0 = time.perf_counter()
-            await asyncio.to_thread(
-                client.chat.completions.create,
-                model=self._cfg.model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=16,  # requesty rejects max_tokens < 16
+            await run_detached(
+                lambda: client.chat.completions.create(
+                    model=self._cfg.model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=16,  # requesty rejects max_tokens < 16
+                )
             )
             self._log.info("llm warmup ok in %.0f ms", (time.perf_counter() - t0) * 1000)
         except Exception as exc:
@@ -117,15 +120,16 @@ class Brain:
             return await self._mock_respond(user_text, t0, on_action, on_sentence)
         client = self._get_client()
         messages = self.build_messages(user_text, events, state)
-        stream = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=self._cfg.model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=self._cfg.temperature,
-            max_tokens=self._cfg.max_tokens,
-            stream=True,
+        stream = await run_detached(
+            lambda: client.chat.completions.create(
+                model=self._cfg.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                temperature=self._cfg.temperature,
+                max_tokens=self._cfg.max_tokens,
+                stream=True,
+            )
         )
         ttft, actions, content = await self._consume(stream, on_action, on_sentence)
         total_ms = (time.perf_counter() - t0) * 1000
@@ -149,8 +153,11 @@ class Brain:
         on_action: OnAction | None,
         on_sentence: OnSentence | None,
     ) -> tuple[float | None, list[Action], str]:
-        """Consume a streaming completion chunk-by-chunk (one `next` per worker-thread hop,
-        so the event loop stays responsive between chunks)."""
+        """Consume a streaming completion on one daemon reader thread.
+
+        Chunks are pushed onto an asyncio.Queue so the event loop stays responsive
+        between tokens without spawning a new thread per `next(stream)`.
+        """
         t0 = time.perf_counter()
         ttft: float | None = None
         tools: dict[int, dict[str, str]] = {}
@@ -158,6 +165,20 @@ class Brain:
         actions: list[Action] = []
         content_parts: list[str] = []
         sent = 0  # chars of streamed text already emitted as sentences
+        q: asyncio.Queue[Any] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        done = object()
+
+        def _reader() -> None:
+            try:
+                for chunk in stream:
+                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+            except BaseException as exc:
+                loop.call_soon_threadsafe(q.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, done)
+
+        threading.Thread(target=_reader, daemon=True, name="shikigami-llm-stream").start()
 
         async def emit_sentences(text: str) -> None:
             nonlocal sent
@@ -195,11 +216,13 @@ class Brain:
             if action.type == "say":
                 await flush_text(action.text)  # emit what streaming didn't cover
 
-        it = iter(stream)
         while True:
-            chunk = await asyncio.to_thread(next, it, None)
-            if chunk is None:
+            item = await q.get()
+            if item is done:
                 break
+            if isinstance(item, BaseException):
+                raise item
+            chunk = item
             if ttft is None:
                 ttft = (time.perf_counter() - t0) * 1000
             if not chunk.choices:

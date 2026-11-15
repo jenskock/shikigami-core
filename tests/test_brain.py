@@ -34,6 +34,7 @@ def test_system_prompt_contains_personality(tmp_path):
     assert msgs[0]["role"] == "system"
     assert "Shikigami" in msgs[0]["content"]
     assert "name: Jens" in msgs[0]["content"]
+    assert "always reply in German" in msgs[0]["content"]
     assert msgs[1]["content"].endswith("human says: hi")
 
 

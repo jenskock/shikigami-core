@@ -15,6 +15,8 @@ def build_system_prompt(p: Personality, mood: str, facts: list[str]) -> str:
 
 Voice: {p.voice}
 
+Language: always reply in {p.language}, no matter what language the human uses.
+
 Rules:
 {rules}
 

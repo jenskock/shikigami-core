@@ -55,6 +55,8 @@ class SimMotion(Motion):
         await self._run("wag tail", duration_s or 2.0)
 
     async def look_at(self, x: float, y: float) -> None:
+        self._state.gaze_x = max(-1.0, min(1.0, float(x)))
+        self._state.gaze_y = max(-1.0, min(1.0, float(y)))
         await self._run(f"look_at ({x:+.2f}, {y:+.2f})")
 
     async def stop(self) -> None:
