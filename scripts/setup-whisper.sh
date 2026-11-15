@@ -9,8 +9,8 @@
 # Usage: scripts/setup-whisper.sh [model] [port]
 #   model: HuggingFace / faster-whisper id (default: Systran/faster-whisper-medium)
 #   port:  8000 (default; piper uses 5000)
-# Env:   WHISPER_CUDA=1 to prefer GPU (device=auto otherwise; set WHISPER_CUDA=0
-#        and CUDA_VISIBLE_DEVICES= to force CPU). WHISPER_VENV to override the venv path.
+# Env:   WHISPER_CUDA=0 to force CPU (CUDA_VISIBLE_DEVICES=). WHISPER_VENV /
+#        WHISPER_DATA_DIR to override paths. Optional HF_TOKEN for Hub rate limits.
 set -euo pipefail
 
 MODEL="${1:-Systran/faster-whisper-medium}"
@@ -18,8 +18,16 @@ PORT="${2:-8000}"
 VENV="${WHISPER_VENV:-$HOME/whisper-venv}"
 BASE_URL="http://localhost:${PORT}"
 DATA_DIR="${WHISPER_DATA_DIR:-$HOME/whisper-data}"
+SERVER_PID=""
 
 step() { printf '\n==> %s\n' "$*"; }
+
+cleanup() {
+  if [ -n "${SERVER_PID}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+trap 'ec=$?; if [ "$ec" -ne 0 ]; then cleanup; fi' EXIT
 
 step "creating venv at $VENV"
 python3 -m venv "$VENV"
@@ -30,8 +38,25 @@ step "installing faster-whisper-server (pulls faster-whisper / ctranslate2 — c
 mkdir -p "$DATA_DIR"
 LOG="$VENV/server.log"
 
+# faster-whisper-server 0.0.3 crashes on first request if the model is not already
+# in the HF cache (buggy logger.info in _log_download_if_needed). Pre-download
+# (and warm-load) so the self-test never hits that path.
+step "pre-downloading model $MODEL into the HuggingFace cache (first run can take a while)"
+MODEL="$MODEL" "$VENV/bin/python" - <<'PY'
+import os
+from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
+
+model_id = os.environ["MODEL"]
+print("downloading", model_id)
+path = download_model(model_id)
+print("cached at", path)
+print("warm-loading WhisperModel (device=auto)…")
+WhisperModel(model_id)  # device=auto → CUDA when available
+print("model ready")
+PY
+
 # Single-model mode ignores the request "model" form field and always uses this path.
-# device=auto (faster-whisper default) picks CUDA when available.
 if [ "${WHISPER_CUDA:-1}" = "0" ]; then
   export CUDA_VISIBLE_DEVICES=""
   step "starting whisper server on port $PORT (cpu forced, model=$MODEL, log: $LOG)"
@@ -92,6 +117,9 @@ if [ "$code" != "200" ]; then
   exit 1
 fi
 echo "response: $(head -c 200 "$RESP")"
+
+# success — keep the server running; clear the failure-only trap cleanup
+trap - EXIT
 
 echo
 echo "OK — whisper is running on $BASE_URL (pid $SERVER_PID)"
