@@ -119,18 +119,18 @@ class Brain:
         on_action: OnAction | None,
     ) -> BrainResult:
         """No-network canned reply for dev/tests (`llm.mock: true`)."""
+        reply = f"(mock Shikigami) You said: {user_text!r}. Hi!"
         message = fake_message(
             [
                 ("emote", {"name": "happy"}),
-                ("say", {"text": f"(mock Shikigami) You said: {user_text!r}. Hi!"}),
                 ("move", {"motion": "wag", "duration_s": 1.0}),
-            ]
+            ],
+            content=reply,
         )
         actions = parse_message(message)
         if on_action:
             for action in actions:
                 await on_action(action)
-        reply = next((a.text for a in actions if a.type == "say"), "")
         return BrainResult(
             actions=actions,
             reply=reply,

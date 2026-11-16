@@ -1,7 +1,7 @@
-"""Pipecat voice session: mic or text in, tools and speech out.
+"""Pipecat voice session: mic or text in, body tools and speech out.
 
-The robot's body, eyes, reflexes, and dashboard stay in ``App``. This module
-owns the speech subgraph only.
+Speech is the LLM text stream. Body tools (move, emote, remember, idle) run
+beside it. The robot's HAL, eyes, reflexes, and dashboard stay in ``App``.
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import time
 from collections.abc import Awaitable, Callable
 
 import aiohttp
-import httpx
 from openai import BadRequestError, DefaultAsyncHttpxClient
+from openai import Timeout as OpenAITimeout
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -23,8 +23,12 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    InterruptionFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
+    LLMTextFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -53,11 +57,12 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.errors import ErrorCategory
 from pipecat.workers.runner import WorkerRunner
 
-from ..brain.actions import Action
+from ..brain.actions import Action, SayAction
 from ..brain.agent import Brain
 from ..config import Config
 from ..memory.store import MemoryStore
-from .mute import ManualMuteStrategy, MicMute, MovingGateTurnStart
+from .barge_in import MotionAwareVADUserTurnStartStrategy
+from .mute import ManualMuteStrategy, MicMute
 from .piper_http import PiperHttpTTSService
 from .tools import ToolHooks, build_tool_schemas
 from .transport import FakeAudioTransport, SounddeviceTransport
@@ -142,7 +147,12 @@ class SituationProcessor(FrameProcessor):
 
 
 class TurnGate(FrameProcessor):
-    """Run one LLM context at a time so a typed turn cannot overlap a spoken one."""
+    """Run one LLM context at a time so a typed turn cannot overlap a spoken one.
+
+    Idle means LLM done and body tools exited — not that playback finished.
+    An interruption drops the contexts still waiting: the utterance that cut
+    in sends the same conversation again, with its own words added.
+    """
 
     def __init__(self, session: VoiceSession, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -154,14 +164,17 @@ class TurnGate(FrameProcessor):
         if isinstance(frame, LLMContextFrame) and direction == FrameDirection.DOWNSTREAM:
             self._queue.put_nowait(frame)
             return
+        if isinstance(frame, InterruptionFrame):
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
         await self.push_frame(frame, direction)
 
     async def pump(self) -> None:
         while True:
             frame = await self._queue.get()
             try:
-                if self._session.idle:
-                    self._session.mark_busy()
+                self._session.mark_busy()
                 await self.push_frame(frame)
                 await self._session.wait_idle()
             finally:
@@ -192,8 +205,37 @@ class SpeakVisualProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LlmTurnProcessor(FrameProcessor):
+    """Follow one LLM response: its text, its end, and the user cutting it off."""
+
+    def __init__(self, session: VoiceSession, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._session = session
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InterruptionFrame):
+            # The interruption flushes this processor's queue, and with it the
+            # LLMFullResponseEndFrame of the response it cancelled.
+            self._session.note_interrupted()
+        elif direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, LLMFullResponseStartFrame):
+                self._session.note_llm_started()
+            elif isinstance(frame, LLMTextFrame):
+                self._session.append_reply_text(frame.text)
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                self._session.note_llm_finished()
+        await self.push_frame(frame, direction)
+
+
 def _http_client(timeout_s: float) -> DefaultAsyncHttpxClient:
-    return DefaultAsyncHttpxClient(timeout=httpx.Timeout(timeout_s))
+    """HTTP client for OpenAI-compatible STT/TTS.
+
+    OpenAI 3.x ships its own ``Timeout`` (httpx2). Passing std ``httpx.Timeout``
+    nests and blows up mid-request as ``float + Timeout``, which kills STT so
+    the mic hears nothing. Use the SDK's Timeout (or a bare float).
+    """
+    return DefaultAsyncHttpxClient(timeout=OpenAITimeout(timeout_s))
 
 
 def build_tts(
@@ -249,13 +291,17 @@ def _user_params(
                 stop_secs=cfg.voice.vad_stop_secs,
             )
         )
+        # The transport's echo guard keeps the robot's own voice out of the
+        # mic, so whatever the VAD hears is the user. A transcript that
+        # arrives after its turn was closed opens a new one, without
+        # interrupting anything.
         start = [
-            MovingGateTurnStart(
+            MotionAwareVADUserTurnStartStrategy(
                 barge_in=cfg.voice.barge_in,
                 interrupt_while_moving=cfg.voice.interrupt_while_moving,
                 moving=moving,
             ),
-            TranscriptionUserTurnStartStrategy(),
+            TranscriptionUserTurnStartStrategy(enable_interruptions=False),
         ]
         if cfg.voice.smart_turn:
             stop = [
@@ -266,7 +312,13 @@ def _user_params(
                 )
             ]
         else:
-            stop = [SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=cfg.sim.vad_silence_s)]
+            # Wait for the transcript before closing the turn.
+            stop = [
+                SpeechTimeoutUserTurnStopStrategy(
+                    user_speech_timeout=cfg.sim.vad_silence_s,
+                    wait_for_transcript=True,
+                )
+            ]
     else:
         vad = None
         start = [TranscriptionUserTurnStartStrategy()]
@@ -285,14 +337,50 @@ def _user_params(
     )
 
 
+_BACKGROUND_PREFIX = "[Background update, not said by the user] "
+
+
+def portable_messages(messages: list) -> list:
+    """Rewrite mid-conversation system/developer messages as user messages.
+
+    Claude (and other non-OpenAI models behind Requesty) reject system-like
+    messages after the first turn. Pipecat can deliver tool results as
+    ``developer``; keep the first system prompt, rewrite the rest.
+    """
+    out: list = []
+    for index, message in enumerate(messages):
+        if (
+            index > 0
+            and isinstance(message, dict)
+            and message.get("role") in {"developer", "system"}
+        ):
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            message = {"role": "user", "content": f"{_BACKGROUND_PREFIX}{content or ''}"}
+        out.append(message)
+    return out
+
+
 class CompatibleLLMService(OpenAILLMService):
     """Chat completions for servers that are not OpenAI's own API.
 
-    ``developer`` is sent as ``user``. A rejection that means "this turn had
-    no spoken text" does not take the service offline.
+    ``developer`` is sent as ``user``. Mid-conversation system/developer
+    messages are rewritten for Claude on Requesty. A rejection that means
+    "this turn had no spoken text" does not take the service offline.
+    Spoken words come from the model text stream (and rare apology frames).
     """
 
     supports_developer_role = False
+
+    def build_chat_completion_params(self, params_from_context):
+        params = super().build_chat_completion_params(params_from_context)
+        messages = params.get("messages")
+        if isinstance(messages, list):
+            params["messages"] = portable_messages(messages)
+        return params
 
     def _classify_error(self, exception: Exception) -> ErrorCategory | None:
         if isinstance(exception, BadRequestError) and empty_dialogue_rejection(exception):
@@ -316,6 +404,8 @@ class VoiceSession(ToolHooks):
         state: Callable[[], dict],
         events: Callable[[], list],
         note_tool_line: Callable[[Action], None],
+        on_ui: Callable[..., None] | None = None,
+        on_heard: Callable[[str], Awaitable[None]] | None = None,
         log: logging.Logger | None = None,
         transport: BaseTransport | None = None,
         tts_service: TTSService | None = None,
@@ -330,6 +420,8 @@ class VoiceSession(ToolHooks):
         self._state = state
         self._events = events
         self._note_tool_line = note_tool_line
+        self._on_ui = on_ui
+        self._on_heard = on_heard
         self._log = log or logging.getLogger("shikigami.voice")
         self._transport_override = transport
         self._tts_override = tts_service
@@ -339,7 +431,11 @@ class VoiceSession(ToolHooks):
         self._idle = asyncio.Event()
         self._idle.set()
         self._tools = 0
-        self._expect_speech = False
+        # Counts turns, so a body tool that outlives its turn cannot close the next.
+        self._turn = 0
+        self._bot_speaking = False
+        # True only after LLMFullResponseEndFrame (tools already ran).
+        self._llm_done = True
         self._reply = ""
         self._input = ""
         self._action_types: list[str] = []
@@ -353,6 +449,7 @@ class VoiceSession(ToolHooks):
         self._runner: WorkerRunner | None = None
         self._http: aiohttp.ClientSession | None = None
         self._gate: TurnGate | None = None
+        self._llm: CompatibleLLMService | None = None
         self._transport: BaseTransport | None = transport
         self.last_summary = ""
 
@@ -378,31 +475,57 @@ class VoiceSession(ToolHooks):
     async def execute(self, action: Action) -> None:
         await self._execute_action(action)
 
-    def expect_speech(self) -> None:
-        self._expect_speech = True
-
-    def tool_enter(self) -> None:
+    def tool_enter(self) -> int:
+        """A body tool started. Returns the turn it belongs to, for ``tool_exit``."""
         self._tools += 1
+        return self._turn
 
-    def tool_exit(self) -> None:
+    def tool_exit(self, turn: int | None = None) -> None:
+        if turn is not None and turn != self._turn:
+            return
         if self._tools <= 0:
             return
         self._tools -= 1
         self._check_done()
 
     def note_bot_started(self) -> None:
-        self._expect_speech = True
+        self._bot_speaking = True
         self._note_ttfa()
+        self._ui(status="speaking")
 
     def note_bot_stopped(self) -> None:
-        self._expect_speech = False
-        self._check_done()
+        self._bot_speaking = False
+        if not self.idle:
+            self._ui(status="thinking")
 
     def on_assistant_text(self, text: str) -> None:
+        """Capture the spoken reply from the assistant aggregator."""
         if text.strip():
             self._reply = text.strip()
-        if self._tools == 0 and not self._expect_speech:
-            self._check_done()
+
+    def append_reply_text(self, text: str) -> None:
+        """Accumulate streamed LLM tokens so a silent tool-only turn is detectable."""
+        if text:
+            self._reply += text
+
+    def note_llm_started(self) -> None:
+        self._llm_done = False
+        self._ui(status="thinking")
+
+    def note_llm_finished(self) -> None:
+        self._llm_done = True
+        self._check_done()
+
+    def note_interrupted(self) -> None:
+        """The user cut in. The turn is over now.
+
+        Body tools keep running (they are not cancelled by an interruption),
+        but they no longer hold the next turn back.
+        """
+        if self.idle:
+            return
+        self._llm_done = True
+        self.finish_turn()
 
     def prepare_context(self, context: LLMContext) -> None:
         messages = context.messages
@@ -426,13 +549,16 @@ class VoiceSession(ToolHooks):
         self.finish_turn()
 
     def mark_busy(self) -> None:
+        self._turn += 1
         self._tools = 0
-        self._expect_speech = False
+        self._bot_speaking = False
+        self._llm_done = False
         self._reply = ""
         self._action_types = []
         self._ttfa_t0 = time.perf_counter()
         self._ttfa_ms = None
         self._idle.clear()
+        self._ui(status="thinking")
         if self._timeout_task is not None:
             self._timeout_task.cancel()
         self._timeout_task = asyncio.create_task(self._turn_timeout())
@@ -446,6 +572,11 @@ class VoiceSession(ToolHooks):
         if self._timeout_task is not None:
             self._timeout_task.cancel()
             self._timeout_task = None
+        self._bot_speaking = False
+        if self._reply.strip():
+            # Log spoken text for the dashboard; speech itself came from LLM TTS.
+            self._note_tool_line(SayAction(text=self._reply))
+            self._log.info("say: %s", self._reply)
         self._memory.log_event(
             "turn",
             {
@@ -457,6 +588,7 @@ class VoiceSession(ToolHooks):
         summary = self._latency_summary()
         self.last_summary = summary
         self._log.info("turn done — %s", summary)
+        self._ui(status="idle", last_latency=summary)
         self._idle.set()
 
     async def start(self) -> None:
@@ -532,6 +664,15 @@ class VoiceSession(ToolHooks):
                 max_tokens=self._cfg.llm.max_tokens,
             ),
         )
+        self._llm = llm
+
+        @llm.event_handler("on_error")
+        async def on_llm_error(service, error) -> None:
+            if error.category is ErrorCategory.INVALID_REQUEST:
+                self._log.warning("voice LLM request rejected, continuing: %s", error.error)
+                await service.set_usable(True)
+            self.finish_turn()
+
         # 1.16 still accepts a system message and warns that 2.0 wants
         # system_instruction. The situation processor rewrites this message
         # on every turn, which that setting does not.
@@ -554,11 +695,19 @@ class VoiceSession(ToolHooks):
             ),
         )
 
+        @pair.user().event_handler("on_user_turn_started")
+        async def _listening(_aggregator, _strategy) -> None:
+            if self.idle:
+                self._ui(status="listening")
+
         @pair.user().event_handler("on_user_turn_stopped")
         async def _heard(_aggregator, _strategy, message) -> None:
             text = (message.content or "").strip()
             if text:
                 self._log.info("heard: %s", text)
+                self._ui(last_heard=text, status="thinking")
+                if self._on_heard is not None:
+                    await self._on_heard(text)
             else:
                 self._log.warning("user turn ended with no transcript")
 
@@ -569,6 +718,7 @@ class VoiceSession(ToolHooks):
         situation = SituationProcessor(self)
         gate = TurnGate(self)
         self._gate = gate
+        llm_turn = LlmTurnProcessor(self)
         speak = SpeakVisualProcessor(self, self._expression)
         processors: list[FrameProcessor] = [transport.input()]
         if stt is not None:
@@ -577,6 +727,7 @@ class VoiceSession(ToolHooks):
         processors.append(gate)
         processors.append(situation)
         processors.append(llm)
+        processors.append(llm_turn)
         if tts is not None:
             processors.append(tts)
         processors.append(transport.output())
@@ -611,12 +762,18 @@ class VoiceSession(ToolHooks):
         await asyncio.wait_for(self._ready.wait(), timeout=self._cfg.llm.timeout_s)
         self.listening = self._audio_in
         self._log.info(
-            "voice pipeline up (transport=%s, stt=%s, tts=%s, barge_in=%s)",
+            "voice pipeline up (transport=%s, stt=%s, tts=%s, barge_in=%s, echo_guard=%s)",
             type(transport).__name__,
             "on" if stt is not None else "off",
             self._cfg.tts.provider if tts is not None else "off",
             self._cfg.voice.barge_in,
+            getattr(transport, "echo_guard", False),
         )
+        if self._audio_in and audio_out and not getattr(transport, "echo_guard", False):
+            self._log.warning(
+                "echo guard is off: the mic stays open while the speaker plays. "
+                "Without headphones the robot will hear and answer itself."
+            )
 
     def _open_transport(self, audio_out: bool) -> tuple[BaseTransport, int]:
         if self._transport_override is not None:
@@ -636,6 +793,8 @@ class VoiceSession(ToolHooks):
                 audio_in=self._audio_in,
                 audio_out=audio_out,
                 log=self._log,
+                echo_guard=self._cfg.voice.echo_guard,
+                echo_tail_secs=self._cfg.voice.echo_tail_secs,
             )
             return live, live.output_rate
         except Exception as exc:
@@ -660,8 +819,23 @@ class VoiceSession(ToolHooks):
         )
 
     def _check_done(self) -> None:
-        if self._tools == 0 and not self._expect_speech:
-            self.finish_turn()
+        # Wait for LLMFullResponseEndFrame and every body tool handler exited.
+        # Playback is not a lock — Status speaking is visual only.
+        if not self._llm_done or self._tools > 0:
+            return
+        if self._input.strip() and not self._reply.strip() and not self._action_types:
+            # Nothing is said in the model's place. Reasoning tokens count
+            # against llm.max_tokens, so a cap that is too low leaves no room
+            # for the answer itself.
+            self._log.warning(
+                "the model said nothing for %r — if this repeats, raise llm.max_tokens",
+                self._input,
+            )
+        self.finish_turn()
+
+    def _ui(self, **fields: object) -> None:
+        if self._on_ui is not None:
+            self._on_ui(**fields)
 
     def _note_ttfa(self) -> None:
         if self._ttfa_t0 is None or self._ttfa_ms is not None:

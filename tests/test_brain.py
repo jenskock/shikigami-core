@@ -19,9 +19,9 @@ def test_mock_respond_returns_actions(tmp_path):
     brain = _brain(tmp_path)
     result = asyncio.run(brain.respond("hello there", [], {"mood": "neutral"}))
     types = [type(a) for a in result.actions]
-    assert SayAction in types and EmoteAction in types and MoveAction in types
-    say = next(a for a in result.actions if isinstance(a, SayAction))
-    assert "hello there" in say.text
+    assert EmoteAction in types and MoveAction in types
+    assert SayAction not in types  # speech is reply text, not a say tool
+    assert "hello there" in result.reply
     assert result.model == "mock"
     assert result.total_ms >= 0
 
@@ -34,7 +34,13 @@ def test_system_prompt_contains_personality(tmp_path):
     assert "Kogane" in msgs[0]["content"]
     assert "name: Jens" in msgs[0]["content"]
     assert "always reply in German" in msgs[0]["content"]
-    assert "say" in msgs[0]["content"]
+    assert "Everything you write is read aloud" in msgs[0]["content"]
+    assert "MUST write a spoken reply every turn" in msgs[0]["content"]
+    assert "welcome alongside that reply" in msgs[0]["content"]
+    assert "Do not invent a say tool" in msgs[0]["content"]
+    assert "spoken words never move the robot" in msgs[0]["content"]
+    assert "MUST call the move tool" in msgs[0]["content"]
+    assert "MUST call `say`" not in msgs[0]["content"]
     assert msgs[1]["content"].endswith("human says: hi")
 
 

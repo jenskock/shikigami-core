@@ -5,12 +5,12 @@ backend: picrawler # sim | pidog | picrawler — SoftPicrawler on Mac; env SHIKI
 log_level: INFO
 
 llm:
-  # OpenAI-compatible router. Requesty is the default; local Ollama: http://jesktop:11434/v1
-  base_url: "https://router.requesty.ai/v1"
+  # Requesty EU router (same as ket-chat voice). Local Ollama: http://jesktop:11434/v1
+  base_url: "https://router.eu.requesty.ai/v1"
   api_key: "" # or SHIKIGAMI_API_KEY / OPENAI_API_KEY in .env
-  model: "openai/gpt-4o-mini" # requesty uses provider-prefixed model names
+  model: "vertex/claude-haiku-5-5@eu" # ket-chat voice: speaks before tools, ~0.3s TTFT
   temperature: 0.7
-  max_tokens: 96 # hard cap — llm time ~= tokens generated; replies are 1-2 sentences
+  max_tokens: 1536 # the model's hidden reasoning counts too; 192 left no room for the reply
   timeout_s: 30
   mock: false # true = canned reply, no network (dev/tests)
 
@@ -36,11 +36,17 @@ tts:
 # Pipecat turn-taking. sim.vad_threshold / vad_listen_s are unused leftovers.
 # sim.vad_silence_s is Smart Turn's stop_secs (and the silence timeout when smart_turn is off).
 voice:
-  barge_in: true # a new utterance can interrupt speech
+  barge_in: true # a new utterance interrupts what the robot is doing (see echo_guard)
   interrupt_while_moving: false # while the body is moving, barge-in does not cut speech off
-  smart_turn: true # local Smart Turn v3 ONNX. false = silence timeout only
+  smart_turn: false # ket-chat uses speech-timeout + wait_for_transcript; Smart Turn optional
   vad_confidence: 0.7 # Silero
   vad_stop_secs: 0.2 # Silero stop; keep short when Smart Turn is on
+  # The mic is next to the speaker. The echo guard closes it while the robot is
+  # audible, so the robot cannot hear, interrupt, or answer itself. You can cut
+  # in while it thinks or moves, not while it talks. Turn the guard off only
+  # with headphones or a speakerphone that cancels its own echo.
+  echo_guard: true
+  echo_tail_secs: 0.3 # room echo after the last sound; device latency is added on top
   transport: sounddevice # sounddevice | fake (tests and machines without PortAudio)
 
 sim:
@@ -66,6 +72,7 @@ reflexes:
   hz: 20 # fast local loop, no network
   obstacle_cm: 25 # stop when something is closer than this
   touch_react: true
+  emote_gestures: true # a small body gesture goes with each face (never walking)
 
 memory:
   path: "data/memory.sqlite3"

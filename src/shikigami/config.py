@@ -18,7 +18,7 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     model: str = "gpt-4o-mini"
     temperature: float = 0.7
-    max_tokens: int = 256
+    max_tokens: int = 1536  # hidden reasoning tokens count against this too
     timeout_s: float = 30.0
     mock: bool = False  # canned reply, no network (dev/tests)
 
@@ -41,9 +41,11 @@ class VoiceConfig(BaseModel):
 
     barge_in: bool = True
     interrupt_while_moving: bool = False
-    smart_turn: bool = True
+    smart_turn: bool = False  # ket-chat voice uses speech-timeout + wait_for_transcript
     vad_confidence: float = 0.7
     vad_stop_secs: float = 0.2  # Silero stop; keep this short when Smart Turn is on
+    echo_guard: bool = True  # close the mic while the speaker is audible
+    echo_tail_secs: float = 0.3  # room echo after the last sound; device latency is added
     transport: VoiceTransport = "sounddevice"
 
 
@@ -87,6 +89,7 @@ class ReflexConfig(BaseModel):
     hz: float = 20.0
     obstacle_cm: float = 25.0
     touch_react: bool = True
+    emote_gestures: bool = True  # a small body gesture goes with each face
 
 
 class MemoryConfig(BaseModel):
@@ -204,6 +207,10 @@ def load_config(path: str | Path | None = None) -> Config:
         cfg.voice.interrupt_while_moving = flag
     if (flag := _env_bool("VOICE_SMART_TURN")) is not None:
         cfg.voice.smart_turn = flag
+    if (flag := _env_bool("VOICE_ECHO_GUARD")) is not None:
+        cfg.voice.echo_guard = flag
+    if v := _env("VOICE_ECHO_TAIL_SECS"):
+        cfg.voice.echo_tail_secs = float(v)
     if v := _env("SHIKIGAMI_VOICE_TRANSPORT"):
         if v not in _VOICE_TRANSPORTS:
             raise ValueError(

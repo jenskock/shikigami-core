@@ -29,6 +29,32 @@ from .bus import EventBus
 from .latency import LatencyTracker
 from .stdin_lines import StdinLines
 
+# SoftPicrawler / device gait: ~1 cycle ≈ 0.4 s (matches PicrawlerMotion.steps_for_duration).
+_SECS_PER_STEP = 0.4
+
+
+def _duration_for_move(action: MoveAction) -> float | None:
+    """Prefer explicit steps (counted strides) over duration_s."""
+    if action.steps is not None and action.steps > 0:
+        return float(action.steps) * _SECS_PER_STEP
+    return action.duration_s
+
+
+# One small body gesture per face, from the crawler's named actions. None of
+# them walks or turns the robot; each ends standing where it started.
+EMOTE_GESTURES: dict[str, tuple[str, ...]] = {
+    "happy": ("wave",),
+    "love": ("look up", "stand"),
+    "curious": ("look left", "look right", "stand"),
+    "surprised": ("look up", "stand"),
+    "confused": ("look right", "stand"),
+    "scared": ("look down", "stand"),
+    "sad": ("look down", "stand"),
+    "sleepy": ("look down", "stand"),
+    "angry": ("push up", "stand"),
+    "mischievous": ("look right", "look left", "stand"),
+}
+
 
 class App:
     def __init__(
@@ -54,6 +80,9 @@ class App:
         self._reflex: ReflexLoop | None = None
         self._reflex_task: asyncio.Task | None = None
         self._turn_lock = asyncio.Lock()  # serialize stdin / dashboard turns
+        self._body_lock = asyncio.Lock()  # one body motion at a time: moves and gestures
+        self._posture = "stand"  # stand | sit | lie, as last asked for
+        self._gestures: set[asyncio.Task] = set()
         self._stop_event = asyncio.Event()
         self.voice: VoiceSession | None = None
         self._use_voice = use_voice
@@ -77,9 +106,13 @@ class App:
                 state=self._state_dict,
                 events=lambda: self.memory.recent_events(8),
                 note_tool_line=self._note_tool,
+                on_ui=self._set_sim_state,
+                on_heard=self._on_voice_heard,
                 log=logging.getLogger("shikigami.voice"),
             )
             await self.voice.start()
+            if self.voice.listening:
+                self._set_sim_state(status="idle", mic="idle")
         tracker = None
         if self.cfg.perception.track_faces:
             tracker = FaceTracker(
@@ -171,6 +204,12 @@ class App:
         if self._ui_state is not None:
             self._ui_state.append_tool(line)
 
+    async def _on_voice_heard(self, text: str) -> None:
+        """Mic turn transcript: same dashboard breadcrumbs as a typed turn."""
+        heard = text if len(text) <= 48 else text[:47] + "…"
+        self._note_tool_marker(f"── turn · {heard} ──")
+        await self.bus.publish("heard", {"text": text})
+
     async def _submit_text(self, text: str) -> None:
         """Dashboard fire-and-forget entry: serialize via handle_text, log failures."""
         try:
@@ -204,6 +243,7 @@ class App:
         elif isinstance(action, EmoteAction):
             with tracker.stage("exec:emote"):
                 await self.hal.expression.emote(action.name)
+            self._start_gesture(action.name)
         elif isinstance(action, RememberAction):
             with tracker.stage("exec:remember"):
                 self.memory.remember(action.key, action.value)
@@ -214,13 +254,66 @@ class App:
         else:
             assert_never(action)
 
-    async def _exec_move(self, action: MoveAction) -> None:
+    def _start_gesture(self, emote: str) -> None:
+        """Play the face's body gesture in the background, if the body is free.
+
+        Skipped while the robot moves, sits, or lies, and while another gesture
+        runs: a gesture must never fight a move the human asked for.
+        """
+        steps = EMOTE_GESTURES.get(emote.lower().strip())
+        if (
+            not steps
+            or not self.cfg.reflexes.emote_gestures
+            or self._posture != "stand"
+            or self.hal.motion.moving
+            or self._body_lock.locked()
+        ):
+            return
+        task = asyncio.create_task(self._run_gesture(steps), name=f"gesture-{emote}")
+        self._gestures.add(task)
+        task.add_done_callback(self._gestures.discard)
+
+    async def _run_gesture(self, steps: tuple[str, ...]) -> None:
         motion = self.hal.motion
+        try:
+            async with self._body_lock:
+                for step in steps:
+                    if step == "stand":
+                        await motion.stand()
+                    else:
+                        await motion.play_action(step)
+        except Exception as exc:
+            self.log.warning("gesture %s failed: %s", "/".join(steps), exc)
+
+    async def _exec_move(self, action: MoveAction) -> None:
+        # A gesture in flight finishes first; it is short and ends standing.
+        async with self._body_lock:
+            await self._exec_move_locked(action)
+        if action.motion in ("sit", "lie"):
+            self._posture = action.motion
+        elif action.motion != "look_at":
+            self._posture = "stand"
+
+    async def _exec_move_locked(self, action: MoveAction) -> None:
+        motion = self.hal.motion
+        duration_s = _duration_for_move(action)
         match action.motion:
-            case "walk":
-                await motion.walk(action.direction, action.speed, action.duration_s)
-            case "turn":
-                await motion.turn(action.direction, action.angle_deg, action.speed)
+            case "walk" | "forward" | "backward":
+                direction = (
+                    "backward"
+                    if action.motion == "backward" or action.direction in ("back", "backward")
+                    else "forward"
+                )
+                await motion.walk(direction, action.speed, duration_s)
+            case "turn" | "turn_left" | "turn_right":
+                direction = (
+                    "left"
+                    if action.motion == "turn_left"
+                    else "right"
+                    if action.motion == "turn_right"
+                    else action.direction
+                )
+                await motion.turn(direction, action.angle_deg, action.speed)
             case "sit":
                 await motion.sit()
             case "stand":
@@ -228,7 +321,7 @@ class App:
             case "lie":
                 await motion.lie()
             case "wag":
-                await motion.wag(action.duration_s)
+                await motion.wag(duration_s)
             case "look_at":
                 await motion.look_at(0.0, 0.0)
             case "stop":

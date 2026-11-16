@@ -10,6 +10,8 @@ the server ``scripts/setup-piper.sh`` starts and never imports ``piper``.
 from __future__ import annotations
 
 import asyncio
+import io
+import wave
 from collections.abc import AsyncGenerator
 from urllib.parse import urlparse
 
@@ -24,6 +26,18 @@ _SYNTH_PATHS = ("/synthesize", "/api/tts")
 
 async def _one_chunk(body: bytes) -> AsyncGenerator[bytes, None]:
     yield body
+
+
+def wav_pcm(body: bytes) -> tuple[bytes, int]:
+    """Return (pcm_int16_mono_or_multi, sample_rate) from a complete WAV body.
+
+    Reads the whole response so a short first network chunk cannot strand the
+    RIFF header or truncate the utterance after the first frame.
+    """
+    with wave.open(io.BytesIO(body), "rb") as wav:
+        rate = wav.getframerate()
+        pcm = wav.readframes(wav.getnframes())
+    return pcm, rate
 
 
 def candidate_urls(base_url: str) -> list[str]:
@@ -101,34 +115,34 @@ class PiperHttpTTSService(TTSService):
                 "Start one with `make setup-piper`."
             )
 
+    async def _fetch_wav(self, url: str, text: str) -> bytes:
+        async with self._session.post(
+            url,
+            json={"text": text},
+            headers={"Content-Type": "application/json"},
+            timeout=self._timeout,
+        ) as response:
+            body = await response.read()
+            if response.status != 200:
+                raise RuntimeError(f"piper-http {response.status}: {body[:200]!r}")
+            return body
+
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         try:
             url, probed = await self._resolve_url(text)
+            body = probed if probed is not None else await self._fetch_wav(url, text)
+            pcm, rate = wav_pcm(body)
         except Exception as exc:
             yield ErrorFrame(error=f"piper-http: {exc}")
+            yield TTSStoppedFrame(context_id=context_id)
             return
-        if probed is not None:
-            async for frame in self._stream_audio_frames_from_iterator(
-                _one_chunk(probed), strip_wav_header=True, context_id=context_id
-            ):
-                yield frame
+        if not pcm:
+            yield TTSStoppedFrame(context_id=context_id)
             return
-        try:
-            async with self._session.post(
-                url,
-                json={"text": text},
-                headers={"Content-Type": "application/json"},
-                timeout=self._timeout,
-            ) as response:
-                if response.status != 200:
-                    err = await response.text()
-                    yield ErrorFrame(error=f"piper-http {response.status}: {err}")
-                    yield TTSStoppedFrame(context_id=context_id)
-                    return
-                chunks = response.content.iter_chunked(self.chunk_size or 4096)
-                async for frame in self._stream_audio_frames_from_iterator(
-                    chunks, strip_wav_header=True, context_id=context_id
-                ):
-                    yield frame
-        except Exception as exc:
-            yield ErrorFrame(error=f"piper-http: {exc}")
+        async for frame in self._stream_audio_frames_from_iterator(
+            _one_chunk(pcm),
+            strip_wav_header=False,
+            in_sample_rate=rate,
+            context_id=context_id,
+        ):
+            yield frame

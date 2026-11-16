@@ -18,6 +18,8 @@ class EyeState:
     top_lid_angle: float = 0.0  # degrees; + = outer corner raised (angry brow)
     top_lid_coverage: float = 0.05  # 0 open .. 1 fully covering from top
     bottom_lid_coverage: float = 0.08
+    bottom_lid_curve: float = 0.0  # 0 flat .. 1 arched up in the middle (smiling cheek)
+    pupil_scale: float = 1.0  # 0 hides the pupil (smiling eyes), <1 pinpoint, >1 big
     pupil_offset_x: float = 0.0  # -1..1 inside open aperture
     pupil_offset_y: float = 0.0
     highlight_offset_x: float = -0.35

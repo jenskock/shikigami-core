@@ -7,6 +7,7 @@ import logging
 from typing import Any, Protocol
 
 from ..interfaces import Motion
+from ..sim.body_view import feet_world, integrate_stance_odometry
 from ..sim.state import SimState
 from .soft import SERVO_LABELS, SoftPicrawler
 
@@ -54,6 +55,8 @@ class PicrawlerMotion(Motion):
         self._log = log
         self._state = state
         self._moving = False
+        # Previous body-frame feet for stance-foot odometry (BODY world pose).
+        self._prev_feet: list[tuple[float, float, float]] | None = None
 
     @property
     def moving(self) -> bool:
@@ -69,6 +72,18 @@ class PicrawlerMotion(Motion):
         self._state.servo_angles = [float(a) for a in angles]
         self._state.leg_coords = [[float(x) for x in leg] for leg in coords]
         self._state.servo_labels = list(SERVO_LABELS)
+
+        feet = feet_world(coords)
+        self._state.body_x, self._state.body_y, self._state.body_yaw_deg = (
+            integrate_stance_odometry(
+                self._prev_feet,
+                feet,
+                self._state.body_x,
+                self._state.body_y,
+                self._state.body_yaw_deg,
+            )
+        )
+        self._prev_feet = list(feet)
 
     async def _run(
         self, label: str, fn: Any, *args: Any, animate: bool = True, **kwargs: Any

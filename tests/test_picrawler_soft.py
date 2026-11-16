@@ -63,14 +63,61 @@ def test_picrawler_motion_publishes_servos():
         assert state.servo_labels == list(SERVO_LABELS)
         assert len(state.leg_coords) == 4
 
+        y_before = state.body_y
         await motion.walk("forward", speed=0.6, duration_s=0.4)
         assert "walk forward" in state.last_motion
         assert len(state.servo_angles) == 12
+        # Stance odometry should carry the body forward (grid slides under).
+        assert state.body_y > y_before + 5.0
 
+        yaw_before = state.body_yaw_deg
+        await motion.turn("left")
+        assert state.body_yaw_deg != yaw_before
+
+        y_after_turn = state.body_y
         await motion.play_action("dance")
         assert "dance" in state.last_motion
+        # Dance may nudge pose slightly; body should still have walked forward.
+        assert state.body_y > 5.0 or y_after_turn > 5.0
 
     asyncio.run(_run())
+
+
+def test_playback_speed_shortens_keyframe_transition(monkeypatch):
+    sleeps: list[float] = []
+
+    def _sleep(dt: float) -> None:
+        sleeps.append(dt)
+
+    monkeypatch.setattr("shikigami.hal.picrawler.soft.time.sleep", _sleep)
+    c = SoftPicrawler(frame_delay_s=0.1)
+    c.display_hz = 30.0
+    c.get_playback_speed = lambda: 2.0
+    # Start from a different pose so lerp has work to do.
+    c.current_coord = [[0.0, 0.0, -50.0] for _ in range(4)]
+    c.do_step([[45.0, 45.0, -50.0]] * 4, speed=50)
+    # duration = 0.1 / 2 = 0.05s → ~2 samples at 30 Hz; sleeps sum to duration.
+    assert sleeps
+    assert abs(sum(sleeps) - 0.05) < 1e-9
+
+
+def test_soft_interpolates_at_display_hz(monkeypatch):
+    monkeypatch.setattr("shikigami.hal.picrawler.soft.time.sleep", lambda _dt: None)
+    c = SoftPicrawler(frame_delay_s=0.1)
+    c.display_hz = 30.0
+    c.current_coord = [[0.0, 0.0, -50.0] for _ in range(4)]
+    poses: list[list[list[float]]] = []
+
+    def _capture() -> None:
+        poses.append([list(leg) for leg in c.current_step_all_leg_value()])
+
+    c.on_pose = _capture
+    c.do_step([[45.0, 45.0, -50.0]] * 4, speed=50)
+    # 0.1s @ 30 Hz → 3 published samples (not a single snap).
+    assert len(poses) == 3
+    assert poses[0] != poses[-1]
+    # Mid sample is between start and end on X.
+    assert 0.0 < poses[0][0][0] < poses[-1][0][0]
 
 
 def test_soft_on_pose_fires_each_frame():

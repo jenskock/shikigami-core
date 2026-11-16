@@ -79,7 +79,14 @@ Barge-in is on by default and is held off while `motion.moving` is true
 (`voice.interrupt_while_moving`). Dashboard mute drops mic audio immediately; the
 chat field still submits.
 
-`llm.max_tokens` stays capped (96). A warmup call at startup removes cold-start cost.
+The mic sits next to the speaker, so the echo guard (`voice.echo_guard`) closes it
+for as long as the speaker is audible, plus `voice.echo_tail_secs` and the device
+latency. The robot cannot hear, interrupt, or answer itself. The price is that you
+can cut in while it thinks or moves, but not while it talks. Turn the guard off only
+with headphones or a speakerphone that cancels its own echo.
+
+`llm.max_tokens` (1536) has to cover the model's hidden reasoning as well as the reply;
+reply length is set by the prompt. A warmup call at startup removes cold-start cost.
 Each spoken turn logs `ttfa=…ms` from the moment the turn is accepted until the first
 output audio. That number was not measured on a real mic in this environment.
 

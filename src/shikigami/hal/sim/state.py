@@ -22,6 +22,12 @@ class SimState:
         self.servo_angles: list[float] = []
         self.servo_labels: list[str] = []
         self.leg_coords: list[list[float]] = []
+        # World pose on the floor (mm / deg) — BODY view translates the stick figure.
+        self.body_x: float = 0.0
+        self.body_y: float = 0.0
+        self.body_yaw_deg: float = 0.0
+        # SoftPicrawler animation pace multiplier (1.0 = default frame delay).
+        self.playback_speed: float = 1.0
         self.tool_log: list[str] = []  # dashboard TOOLS panel (newest last)
 
     def append_tool(self, line: str) -> None:
