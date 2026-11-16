@@ -32,6 +32,35 @@ def test_parse_move_defaults():
     a = parse_tool_call("move", {"motion": "sit"})
     assert isinstance(a, MoveAction)
     assert a.direction == "forward" and a.speed == 0.5 and a.duration_s is None
+    assert a.steps is None
+
+
+def test_parse_move_steps():
+    a = parse_tool_call("move", {"motion": "walk", "steps": 3, "direction": "forward"})
+    assert isinstance(a, MoveAction)
+    assert a.steps == 3
+
+
+def test_duration_for_move_prefers_steps():
+    from shikigami.app.loop import _SECS_PER_STEP, _duration_for_move
+
+    stepped = MoveAction(motion="walk", steps=3, duration_s=9.0)
+    assert _duration_for_move(stepped) == pytest.approx(3 * _SECS_PER_STEP)
+    timed = MoveAction(motion="walk", duration_s=1.2)
+    assert _duration_for_move(timed) == pytest.approx(1.2)
+    assert _duration_for_move(MoveAction(motion="sit")) is None
+
+
+def test_move_schema_requires_real_body_action():
+    from shikigami.brain.actions import TOOL_SCHEMAS
+
+    move = next(t for t in TOOL_SCHEMAS if t["function"]["name"] == "move")
+    desc = move["function"]["description"]
+    assert "Speech alone does nothing" in desc
+    props = move["function"]["parameters"]["properties"]
+    assert "steps" in props
+    assert "dance" in props["motion"]["enum"]
+    assert "tanzen" in props["motion"]["description"].lower()
 
 
 def test_parse_say_emote_remember_idle():
@@ -61,9 +90,17 @@ def test_parse_invalid_args_raise():
 
 
 def test_parse_message_tool_calls():
-    msg = fake_message([("say", {"text": "hello"}), ("emote", {"name": "curious"})])
+    msg = fake_message([("emote", {"name": "curious"}), ("move", {"motion": "wag"})])
     actions = parse_message(msg)
-    assert [type(a) for a in actions] == [SayAction, EmoteAction]
+    assert [type(a) for a in actions] == [EmoteAction, MoveAction]
+
+
+def test_tool_schemas_have_no_say():
+    from shikigami.brain.actions import TOOL_SCHEMAS
+
+    names = [spec["function"]["name"] for spec in TOOL_SCHEMAS]
+    assert "say" not in names
+    assert "move" in names and "emote" in names
 
 
 def test_parse_message_content_fallback():

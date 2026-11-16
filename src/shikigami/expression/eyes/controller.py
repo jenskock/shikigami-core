@@ -30,6 +30,26 @@ _REACT: dict[str, dict[str, float]] = {
 }
 
 
+# How each emotion moves while it is held, on top of blinks and gaze wander.
+# tremble/shake: fast sideways jitter (eye widths). bob: slow vertical bounce.
+# droop: the upper lid sinks and recovers. glance: a slow sideways look.
+# look_down: gaze offset. pulse: breathing size change. wander: gaze wander gain.
+_MOTION: dict[str, dict[str, float]] = {
+    "happy": {"bob": 0.05, "bob_hz": 0.9},
+    "love": {"bob": 0.03, "bob_hz": 0.5, "pulse": 0.05},
+    "sad": {"look_down": 0.45, "wander": 0.3},
+    "angry": {"shake": 0.012, "wander": 0.2},
+    "surprised": {"wander": 0.2},
+    "sleepy": {"droop": 0.2, "wander": 0.25},
+    "curious": {"wander": 1.5, "pulse": 0.025},
+    "confused": {"glance": 0.45, "glance_hz": 0.35},
+    "scared": {"tremble": 0.035, "wander": 1.3},
+    "focused": {"wander": 0.1},
+    "mischievous": {"glance": 0.6, "glance_hz": 0.22},
+}
+_POP_SECS = 0.35  # a new emotion arrives with a small pop, so the change is seen
+
+
 @dataclass
 class _EmotionHold:
     name: str
@@ -61,6 +81,7 @@ class EyesEngine:
     _t: float = 0.0
     _reaction: _Reaction | None = None
     _last_gaze: tuple[float, float] = (0.0, 0.0)
+    _pop_s: float = 0.0
     frame: FrameState = field(default_factory=FrameState)
 
     def __post_init__(self) -> None:
@@ -88,11 +109,16 @@ class EyesEngine:
         name: str,
         intensity: float = 1.0,
         duration: float | None = None,
+        *,
+        pop: bool = True,
     ) -> None:
         key = name.lower().strip()
         if key not in {e.value for e in Emotion}:
             key = Emotion.NEUTRAL.value
         until = None if duration is None else time.monotonic() + max(0.0, duration)
+        if pop and key != self._emotion.name:
+            self._pop_s = _POP_SECS
+            self.life.request_blink()
         self._emotion = _EmotionHold(name=key, intensity=intensity, until=until)
         self._blend = None
         self._valence = None
@@ -131,7 +157,9 @@ class EyesEngine:
         self._reaction = _Reaction(kind=key, until=time.monotonic() + dur, params=params)
         for emo in Emotion:
             if emo.value in params:
-                self.set_emotion(emo.value, intensity=float(params[emo.value]), duration=dur)
+                self.set_emotion(
+                    emo.value, intensity=float(params[emo.value]), duration=dur, pop=False
+                )
 
     def set_speaking(self, active: bool) -> None:
         self._speaking = active
@@ -150,8 +178,15 @@ class EyesEngine:
         self.life.update(dt)
         self.animator.set_targets(target)
 
-        gx = self._gaze_x * 0.55 + self.life.wander_x + self.life.sacc_x
-        gy = -self._gaze_y * 0.4 + self.life.wander_y + self.life.sacc_y
+        motion = _MOTION.get(self._emotion.name, {}) if self._blend is None else {}
+        wander = motion.get("wander", 1.0)
+        gx = self._gaze_x * 0.55 + self.life.wander_x * wander + self.life.sacc_x
+        gy = -self._gaze_y * 0.4 + self.life.wander_y * wander + self.life.sacc_y
+        if glance := motion.get("glance", 0.0):
+            # Hold the look to each side for a while instead of swinging evenly.
+            swing = math.sin(self._t * math.tau * motion.get("glance_hz", 0.3))
+            gx += glance * max(-1.0, min(1.0, swing * 2.5))
+        gy += motion.get("look_down", 0.0)
         if reaction_fx.get("dizzy", 0.0) > 0.0:
             d = reaction_fx["dizzy"]
             gx += math.sin(self._t * 9.0) * 0.35 * d
@@ -163,8 +198,10 @@ class EyesEngine:
         left, right, gap = self.animator.step(dt)
 
         left, right = _apply_blink(left, right, blink.amount, blink.side)
-        breath = 1.0 + self.life.breath + reaction_fx.get("bounce", 0.0) * 0.08 * math.sin(
-            self._t * 14.0
+        breath = (
+            1.0
+            + self.life.breath
+            + reaction_fx.get("bounce", 0.0) * 0.08 * math.sin(self._t * 14.0)
         )
         left.scale *= breath
         right.scale *= breath
@@ -173,6 +210,7 @@ class EyesEngine:
         if kick := reaction_fx.get("scale_kick", 0.0):
             left.scale *= 1.0 + kick
             right.scale *= 1.0 + kick
+        self._apply_motion(left, right, motion, dt)
 
         self.frame = FrameState(
             left=left,
@@ -185,6 +223,27 @@ class EyesEngine:
         )
         return self.frame
 
+    def _apply_motion(self, left, right, motion: dict[str, float], dt: float) -> None:
+        """The held emotion's own movement, and the pop when it arrives."""
+        t = self._t
+        if self._pop_s > 0.0:
+            self._pop_s = max(0.0, self._pop_s - dt)
+            kick = 0.16 * (self._pop_s / _POP_SECS) ** 2
+            left.scale *= 1.0 + kick
+            right.scale *= 1.0 + kick
+        jitter = motion.get("tremble", 0.0) * math.sin(t * 41.0) + motion.get(
+            "shake", 0.0
+        ) * math.sin(t * 27.0)
+        bob = -motion.get("bob", 0.0) * abs(math.sin(t * math.pi * motion.get("bob_hz", 1.0)))
+        pulse = 1.0 + motion.get("pulse", 0.0) * math.sin(t * 2.6)
+        # The lid sinks slowly, then jerks back up, like fighting sleep.
+        droop = motion.get("droop", 0.0) * ((t * 0.35) % 1.0) ** 2
+        for eye in (left, right):
+            eye.x += jitter
+            eye.y += bob
+            eye.scale *= pulse
+            eye.top_lid_coverage = min(0.9, eye.top_lid_coverage + droop)
+
     def _resolve_target(self) -> EmotionTarget:
         if self._blend:
             base = blend_emotions(self._blend)
@@ -196,6 +255,11 @@ class EyesEngine:
                 self._emotion.intensity,
             )
         r, g, b = self.cfg.color
+        if base.tint is not None:
+            mix = 0.75 * max(0.0, min(1.0, self._emotion.intensity))
+            r, g, b = (
+                int(round(c + (tc - c) * mix)) for c, tc in zip((r, g, b), base.tint, strict=True)
+            )
         base.left.color_r = base.right.color_r = r
         base.left.color_g = base.right.color_g = g
         base.left.color_b = base.right.color_b = b
@@ -228,7 +292,7 @@ def _speaking_mod(target: EmotionTarget, t: float) -> EmotionTarget:
     for eye in (left, right):
         eye.bottom_lid_coverage = min(0.65, eye.bottom_lid_coverage + 0.06 + breath)
         eye.height *= 1.0 + breath
-    return EmotionTarget(left=left, right=right, gap=target.gap)
+    return EmotionTarget(left=left, right=right, gap=target.gap, tint=target.tint)
 
 
 def _apply_blink(left, right, amount: float, side: str):

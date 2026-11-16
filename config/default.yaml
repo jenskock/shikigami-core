@@ -5,12 +5,12 @@ backend: picrawler # sim | pidog | picrawler — SoftPicrawler on Mac; env SHIKI
 log_level: INFO
 
 llm:
-  # OpenAI-compatible router. Requesty is the default; local Ollama: http://jesktop:11434/v1
-  base_url: "https://router.requesty.ai/v1"
+  # Requesty EU router (same as ket-chat voice). Local Ollama: http://jesktop:11434/v1
+  base_url: "https://router.eu.requesty.ai/v1"
   api_key: "" # or SHIKIGAMI_API_KEY / OPENAI_API_KEY in .env
-  model: "openai/gpt-4o-mini" # requesty uses provider-prefixed model names
+  model: "vertex/claude-haiku-5-5@eu" # ket-chat voice: speaks before tools, ~0.3s TTFT
   temperature: 0.7
-  max_tokens: 96 # hard cap — llm time ~= tokens generated; replies are 1-2 sentences
+  max_tokens: 1536 # the model's hidden reasoning counts too; 192 left no room for the reply
   timeout_s: 30
   mock: false # true = canned reply, no network (dev/tests)
 
@@ -22,15 +22,32 @@ stt:
   enabled: true # mic on by default for `uv run sim`; --text-input to type instead
 
 tts:
-  provider: "openai" # openai | piper | piper-http | none (piper-http: TTS_BASE_URL=http://jesktop:5000)
-  base_url: "" # defaults to llm.base_url when empty
+  # piper-http keeps the GPL Piper binary out of this process. OpenAI/Requesty is optional.
+  provider: "piper-http" # openai | piper-http | none. "piper" is refused (in-process GPL).
+  base_url: "http://jesktop:5000" # `make setup-piper` — Mac local piper: http://127.0.0.1:5000
   api_key: ""
-  model: "openai/tts-1" # requesty TTS
-  voice: "alloy"
-  piper_voice: "" # path to .onnx voice for provider=piper
-  response_format: "wav" # WAV only — sim playback cannot decode mp3/opus/…
+  model: "openai/tts-1" # used only when provider=openai (Requesty). OpenAI TTS here is PCM.
+  voice: "alloy" # OpenAI voice. Piper uses the voice loaded by the HTTP server.
+  piper_voice: "" # unused by the app; the setup script picks the server voice
+  response_format: "wav" # piper-http returns WAV. openai TTS in Pipecat is PCM at 24 kHz.
   timeout_s: 30
   enabled: true
+
+# Pipecat turn-taking. sim.vad_threshold / vad_listen_s are unused leftovers.
+# sim.vad_silence_s is Smart Turn's stop_secs (and the silence timeout when smart_turn is off).
+voice:
+  barge_in: true # a new utterance interrupts what the robot is doing (see echo_guard)
+  interrupt_while_moving: false # while the body is moving, barge-in does not cut speech off
+  smart_turn: false # ket-chat uses speech-timeout + wait_for_transcript; Smart Turn optional
+  vad_confidence: 0.7 # Silero
+  vad_stop_secs: 0.2 # Silero stop; keep short when Smart Turn is on
+  # The mic is next to the speaker. The echo guard closes it while the robot is
+  # audible, so the robot cannot hear, interrupt, or answer itself. You can cut
+  # in while it thinks or moves, not while it talks. Turn the guard off only
+  # with headphones or a speakerphone that cancels its own echo.
+  echo_guard: true
+  echo_tail_secs: 0.3 # room echo after the last sound; device latency is added on top
+  transport: sounddevice # sounddevice | fake (tests and machines without PortAudio)
 
 sim:
   window: true # face/state window (opencv)
@@ -38,9 +55,9 @@ sim:
   camera_index: 0
   fake_touch_prob: 0.0 # simulated "pat on the head" events per reflex tick (0 = off)
   fake_sound_prob: 0.0 # simulated sound-direction events per reflex tick (0 = off)
-  vad_threshold: 40.0 # min speech RMS (int16); auto-raised above noise floor (~MacBook speech is 80–250)
-  vad_silence_s: 0.5 # silence after speech before the utterance is sent to STT
-  vad_listen_s: 3.0 # give up (no STT) if no speech starts within this many seconds
+  vad_threshold: 40.0 # unused; Silero uses voice.vad_confidence
+  vad_silence_s: 0.5 # Smart Turn stop_secs (silence before the turn ends)
+  vad_listen_s: 3.0 # unused; the pipeline listens continuously
   mic_device: null # sounddevice device index, null = default input
   speaker_device: null # null = prefer MacBook speakers (avoids silent external DACs like D10s)
   mic_gain: 8.0 # software gain on capture (MacBook speech is often only peak ~150–400)
@@ -55,6 +72,7 @@ reflexes:
   hz: 20 # fast local loop, no network
   obstacle_cm: 25 # stop when something is closer than this
   touch_react: true
+  emote_gestures: true # a small body gesture goes with each face (never walking)
 
 memory:
   path: "data/memory.sqlite3"

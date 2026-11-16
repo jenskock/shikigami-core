@@ -5,6 +5,7 @@
 #   STT_BASE_URL=http://jesktop:8000/v1
 #   STT_MODEL=Systran/faster-whisper-medium
 #   STT_API_KEY=not-needed
+# Pipecat's OpenAISTTService calls that base URL; the app has no separate STT client.
 #
 # Usage: scripts/setup-whisper.sh [model] [port]
 #   model: HuggingFace / faster-whisper id (default: Systran/faster-whisper-medium)

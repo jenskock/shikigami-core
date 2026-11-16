@@ -16,8 +16,6 @@ from .config import REPO_ROOT, Config, load_config
 from .hal import create_hal, resolve_backend
 from .memory.store import MemoryStore
 from .personality.loader import load_personality
-from .voice.stt import STTClient
-from .voice.tts import TTSClient
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -47,15 +45,13 @@ def build_app(cfg: Config, log: logging.Logger) -> App:
         cfg.stt.language = personality.language
     memory = MemoryStore(REPO_ROOT / cfg.memory.path)
     brain = Brain(cfg.llm, personality, memory, log=logging.getLogger("shikigami.brain"))
-    stt = STTClient(cfg.stt) if cfg.stt.enabled else None
-    tts = TTSClient(cfg.tts) if cfg.tts.enabled else None
     bus = EventBus()
 
     async def _persist(e) -> None:
         memory.log_event(e.kind, e.payload)
 
     bus.subscribe("*", _persist)
-    return App(cfg, hal, brain, memory, bus, stt, tts, log=log)
+    return App(cfg, hal, brain, memory, bus, log=log)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -33,11 +33,11 @@ src/shikigami/
 │   └── picrawler/      # Pi stub (import-guarded SunFounder picrawler)
 ├── expression/     # procedural eyes (display-agnostic) + pygame/PIL/cv2 renderers
 ├── reflexes/       # fast local loop (~20 Hz, no network): obstacle stop, touch/sound reacts, idle face
-├── perception/     # VAD, face detection (OpenCV, lazy)
-├── brain/          # LLM agent: events+state in, structured actions out (tool calls, streaming)
+├── perception/     # face detection (OpenCV, lazy)
+├── brain/          # personality, tools, mock LLM. Live turns run in the voice pipeline
 ├── memory/         # SQLite store: facts, recent events, mood
 ├── personality/    # personality.yaml -> validated model -> system prompt
-├── voice/          # STT (Whisper / OpenAI-compatible) + TTS (OpenAI-compatible / Piper)
+├── voice/          # Pipecat: Silero VAD, Smart Turn, STT, tool handlers, TTS
 └── app/            # asyncio main loop, event bus, per-stage latency logging
 ```
 
@@ -58,20 +58,50 @@ Config knobs live under `eyes:` in `config/default.yaml` (color, blink rate,
 `shikigami.expression.eyes.protocol` + stub firmware under
 `expression/eyes/firmware/`. Emotion contact sheet: `docs/eyes_preview.png`.
 
-Data flow per turn: `mic/text -> [stt] -> brain (LLM, streaming tool calls) -> actions
-(move/say/emote/remember/idle) -> HAL (motion/expression/voice)` with every stage timed
-and logged (`latency context=.. llm=.. play=.. total=..`).
+Speech is a [Pipecat](https://github.com/pipecat-ai/pipecat) pipeline. Everything else
+(HAL, eyes, reflexes, face tracking, memory, the dashboard) stays in this repo.
 
-Latency measures: `llm.max_tokens` is hard-capped (96) since generation time ≈ tokens;
-a warmup call at startup removes cold-start cost (client keep-alive afterwards); the LLM
-stream is consumed incrementally — move/emote actions execute the moment their tool call
-finalizes, and say-text is synthesized sentence-by-sentence (TTS runs in the background,
-played in order) so speech overlaps generation instead of adding to it. For the fastest
-TTS use Piper on `jesktop` (`tts.provider: piper-http`, German voice): run
-`make setup-piper` there (creates a venv, installs piper-tts, downloads
-`de_DE-thorsten-medium`, starts the server on :5000 — see `scripts/setup-piper.sh`).
-For the fastest STT run `make setup-whisper` on jesktop (faster-whisper-server on
-:8000, default `Systran/faster-whisper-medium` — see `scripts/setup-whisper.sh`).
+```
+mic (sounddevice) ─┐
+                   ├─ Silero VAD + Smart Turn ─ OpenAI-compatible STT
+typed text ────────┘                                    │
+                                                         ▼
+                              system prompt (mood, facts, state) + tools
+                                                         │
+                         move / emote / remember / idle ─┼─ say → TTS → speaker
+                                                         │
+                                              eyes speak_visual while audio plays
+```
+
+`say` is spoken by pushing text at the TTS service. The other tools call the HAL.
+Tool results do not start a second LLM generation, so the model speaks through `say`.
+Barge-in is on by default and is held off while `motion.moving` is true
+(`voice.interrupt_while_moving`). Dashboard mute drops mic audio immediately; the
+chat field still submits.
+
+The mic sits next to the speaker, so the echo guard (`voice.echo_guard`) closes it
+for as long as the speaker is audible, plus `voice.echo_tail_secs` and the device
+latency. The robot cannot hear, interrupt, or answer itself. The price is that you
+can cut in while it thinks or moves, but not while it talks. Turn the guard off only
+with headphones or a speakerphone that cancels its own echo.
+
+`llm.max_tokens` (1536) has to cover the model's hidden reasoning as well as the reply;
+reply length is set by the prompt. A warmup call at startup removes cold-start cost.
+Each spoken turn logs `ttfa=…ms` from the moment the turn is accepted until the first
+output audio. That number was not measured on a real mic in this environment.
+
+TTS default is `piper-http` at `http://jesktop:5000`. `make setup-piper` creates a
+**separate** venv, installs `piper-tts` (GPL-3.0), downloads `de_DE-thorsten-medium`,
+and serves `POST /synthesize` (see `scripts/setup-piper.sh`). The app never imports
+`piper`. `tts.provider: piper` is refused for that reason. On a Mac, port 5000 is
+often AirPlay Receiver — pass another port to the setup script and set `TTS_BASE_URL`.
+Optional `tts.provider: openai` uses Pipecat's OpenAI TTS client, which asks for PCM
+at 24 kHz. Some OpenAI-compatible routers only return WAV; if speech is silent, use
+piper-http.
+
+STT is Pipecat's OpenAI-compatible client (`/audio/transcriptions`). For low latency,
+`make setup-whisper` on jesktop (faster-whisper-server on :8000, default
+`Systran/faster-whisper-medium`). Cloud fallback: Requesty voxtral, via `STT_BASE_URL`.
 
 ## Quickstart (macOS)
 
@@ -102,26 +132,25 @@ LLM_MODEL=openai/gpt-4o-mini
 SHIKIGAMI_API_KEY=rqsty-sk-...
 ```
 
-STT is OpenAI-compatible `/audio/transcriptions`. For low latency, run Whisper on
-`jesktop` (`make setup-whisper`, default `Systran/faster-whisper-medium` on :8000) and
-point `STT_BASE_URL=http://jesktop:8000/v1`. Cloud fallback: Requesty voxtral.
-Dashboard shows `mic:` + level bar + `heard:`. Mute with the **Mute mic** button or
-**Ctrl+M** (text chat still works). Tune with `sim.vad_threshold` /
-`sim.vad_silence_s` (default 0.5 s after speech). Each spoken turn logs `ttfa=…ms`
-(silence-end → first PCM). Mic errors fall back to text input.
+STT is OpenAI-compatible `/audio/transcriptions` inside the Pipecat pipeline. For low
+latency, run Whisper on `jesktop` (`make setup-whisper`, default
+`Systran/faster-whisper-medium` on :8000) and point `STT_BASE_URL=http://jesktop:8000/v1`.
+Cloud fallback: Requesty voxtral. Dashboard shows `mic:` + level bar + `heard:`.
+Mute with the **Mute mic** button or **Ctrl+M** (text chat still works).
 
-Mic capture uses a continuous stream at the device's native rate (often 48 kHz),
-then resamples to `sim.sample_rate` (16 kHz) for STT. If no speech starts within
-`sim.vad_listen_s` (default 3 s), the cycle ends without calling STT.
+The mic stays open. Silero (`voice.vad_confidence`, `voice.vad_stop_secs`) detects
+speech; Smart Turn (`voice.smart_turn`, fed by `sim.vad_silence_s`) decides the turn
+is finished. `sim.vad_threshold` and `sim.vad_listen_s` are unused. Capture runs at
+the device's native rate and is resampled to `sim.sample_rate` (16 kHz). If PortAudio
+is missing, the pipeline logs that and keeps typed text and tools working
+(`SHIKIGAMI_VOICE_TRANSPORT=fake` forces that path).
 
-Troubleshooting "listening… but nothing happens" (logs `no speech detected, peak rms …`):
+Troubleshooting a silent mic:
 
-- Check the level bar in the dashboard: if it stays at 0 while you talk, the mic
-  delivers silence — on macOS grant **Microphone** permission to your terminal app
-  (System Settings > Privacy & Security > Microphone), or pick another device with
-  `sim.mic_device` (the app logs `input device #N … native … Hz`).
-- If the bar moves but never triggers, lower `sim.vad_threshold`; each quiet cycle
-  logs `peak rms … (threshold …)` so you can see how close you got.
+- Check the level bar: if it stays at 0 while you talk, grant **Microphone**
+  permission to the terminal app, or set `sim.mic_device`.
+- If the bar moves but turns never start, lower `voice.vad_confidence`.
+- `heard:` is the transcript sent to the model. `user turn ended with no transcript` means Whisper returned nothing before `stt.timeout_s`; that turn is not sent, so the next utterance still works.
 
 ## Configuration
 
@@ -140,7 +169,9 @@ Troubleshooting "listening… but nothing happens" (logs `no speech detected, pe
   more double-blinks).
 - `.env` (gitignored, see `.env.example`) — secrets + overrides. Env wins over YAML:
   `SHIKIGAMI_BACKEND`, `SHIKIGAMI_LANGUAGE`, `LLM_BASE_URL`, `LLM_MODEL`,
-  `SHIKIGAMI_API_KEY` / `OPENAI_API_KEY`, `STT_*`, `TTS_*`, `DEPLOY_HOST`.
+  `SHIKIGAMI_API_KEY` / `OPENAI_API_KEY`, `STT_*`, `TTS_*`, `VOICE_BARGE_IN`,
+  `VOICE_INTERRUPT_WHILE_MOVING`, `VOICE_SMART_TURN`, `SHIKIGAMI_VOICE_TRANSPORT`,
+  `DEPLOY_HOST`.
 
 Cloud ↔ local is a config change: point `LLM_BASE_URL` / `STT_BASE_URL` / `TTS_BASE_URL`
 at your Ollama / Whisper (`make setup-whisper`) / Piper (`make setup-piper`) servers on
@@ -175,12 +206,17 @@ make run-sim
 
 Python 3.11 via `uv` (`.python-version`), locked with `uv.lock`. Tests cover action
 parsing, HAL backend selection (incl. the SunFounder import guards), config/env
-overrides, memory, VAD and the mock brain.
+overrides, memory, the mock brain, and the Pipecat pipeline (tool mapping, mute,
+and a fake-audio speak path). `pipecat-ai` is pinned to 1.16.x. Silero and Smart
+Turn ship as ONNX in that package; the `local-smart-turn` extra (PyTorch) is not
+installed. Real mic, speaker, and latency were not measured here.
 
 ## Design principles
 
-- Core never imports vendor or heavy libs; `cv2`/`sounddevice`/`numpy` are lazy and
-  only in the `sim` extra — the Pi 3B+ stays light (no GPU, limited RAM).
+- `cv2`/`sounddevice` stay lazy. `pipecat-ai` (and its ONNX runtime) is a core
+  dependency because the voice pipeline runs on the Pi as well as the Mac. Smart
+  Turn's ONNX model is about 8 MB; measure RSS on the Pi 3B+ before treating that
+  as free.
 - Reflexes cover LLM latency: the fast local loop reacts to obstacles/touch/sound
   even while the brain is "thinking".
 - Secrets only in `.env`, never committed.

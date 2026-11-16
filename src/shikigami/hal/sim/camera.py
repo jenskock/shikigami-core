@@ -69,9 +69,7 @@ class SimCamera(Camera):
         self._cv2 = cv2
         self._cap = self._open_capture()
         if self._cap is None and sys.platform == "darwin":
-            self._log.info(
-                "[sim] camera: open failed — waiting 1.5s for macOS permission dialog…"
-            )
+            self._log.info("[sim] camera: open failed — waiting 1.5s for macOS permission dialog…")
             await asyncio.sleep(1.5)
             self._cap = self._open_capture()
 

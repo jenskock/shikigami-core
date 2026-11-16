@@ -30,6 +30,7 @@ GAIT_ACTIONS = (
     "turn right angle",
 )
 
+
 def _check_stand(func: Callable[..., list]) -> Callable[..., list]:
     def wrapper(self: MoveList) -> list:
         action: list = []
@@ -477,8 +478,12 @@ class SoftPicrawler:
         self.coord_temp = [[60.0, 0.0, -30.0] for _ in range(4)]
         self.servo_positions = list(init_angles) if init_angles is not None else [0.0] * 12
         self.offset = [0.0] * 12
-        self.frame_delay_s = float(frame_delay_s)  # >0 animates BODY panel; tests leave 0
+        self.frame_delay_s = float(frame_delay_s)  # >0 = keyframe transition duration; 0 = snap
         self.on_pose: Callable[[], None] | None = None
+        # Live multiplier from SimState.playback_speed (dashboard Speed control).
+        self.get_playback_speed: Callable[[], float] | None = None
+        # Body-view sample rate while interpolating between gait keyframes.
+        self.display_hz = 30.0
 
     def coord2polar(self, coord: list[float]) -> list[float]:
         x, y, z = coord
@@ -552,9 +557,48 @@ class SoftPicrawler:
                 for frame in action_add:
                     self.do_step(frame, speed=speed)
 
+    def _playback_speed(self) -> float:
+        if self.get_playback_speed is None:
+            return 1.0
+        return max(0.25, min(2.0, float(self.get_playback_speed())))
+
+    def _sdk_time_factor(self, speed: int) -> float:
+        # Higher SDK speed → shorter transition (speed 50 ≈ full delay).
+        return max(0.2, (110 - max(0, min(100, int(speed)))) / 60.0)
+
+    def _commit_coords(self, coords: list[list[float]], *, israise: bool = False) -> list[float]:
+        """IK + publish one pose (no sleep)."""
+        angles_temp: list[list[float]] = []
+        for coord in coords:
+            alpha, beta, gamma = self.coord2polar(coord)
+            angles_temp.append([beta, alpha, gamma])
+        translate: list[float] = []
+        limited_any = False
+        for angles in angles_temp:
+            limited, clipped = self.limit_angle(angles)
+            translate.extend(clipped)
+            limited_any = limited_any or limited
+        if limited_any:
+            if israise:
+                raise ValueError("Coordinates out of controllable range.")
+            limited_coords = []
+            for i in range(4):
+                limited_coords.append(
+                    self.polar2coord([translate[i * 3], translate[i * 3 + 1], translate[i * 3 + 2]])
+                )
+            self.current_coord = [list(c) for c in limited_coords]
+        else:
+            self.current_coord = [list(c) for c in coords]
+        self.coord_temp = [list(c) for c in self.current_coord]
+        self.servo_positions = list(translate)
+        if self.on_pose is not None:
+            self.on_pose()
+        return list(translate)
+
     def set_angle(
         self, angles_list: list[list[float]], speed: int = 50, israise: bool = False
     ) -> list[float]:
+        """Snap (or legacy path): apply joint angles immediately, optional post sleep."""
         translate: list[float] = []
         limited_any = False
         for angles in angles_list:
@@ -577,9 +621,7 @@ class SoftPicrawler:
             self.on_pose()
         delay = self.frame_delay_s
         if delay > 0:
-            # Higher SDK speed → shorter pause (speed 50 ≈ full delay).
-            factor = max(0.2, (110 - max(0, min(100, int(speed)))) / 60.0)
-            time.sleep(delay * factor)
+            time.sleep(delay * self._sdk_time_factor(speed) / self._playback_speed())
         return list(translate)
 
     def do_step(self, _step: str | list, speed: int = 50, israise: bool = False) -> None:
@@ -596,13 +638,38 @@ class SoftPicrawler:
             return
         raise TypeError(f'Invalid "_step" parameter: {type(_step)!r}')
 
-    def _apply_coords(self, one_step: list, speed: int, israise: bool) -> None:
-        angles_temp: list[list[float]] = []
-        for coord in one_step:
-            alpha, beta, gamma = self.coord2polar(coord)
-            angles_temp.append([beta, alpha, gamma])
-        self.coord_temp = [list(c) for c in one_step]
-        self.set_angle(angles_temp, speed, israise)
+    def _apply_coords(self, one_step: list, speed: int, israise: bool = False) -> None:
+        """Move to a keyframe; when animating, lerp foot tips at ``display_hz``."""
+        target = [[float(v) for v in leg[:3]] for leg in one_step]
+        if len(target) != 4:
+            raise ValueError(f"expected 4 leg coords, got {len(target)}")
+
+        delay = self.frame_delay_s
+        if delay <= 0:
+            self._commit_coords(target, israise=israise)
+            return
+
+        start = [list(c) for c in self.current_coord]
+        if len(start) != 4:
+            start = [list(c) for c in target]
+
+        duration = delay * self._sdk_time_factor(speed) / self._playback_speed()
+        hz = max(1.0, float(self.display_hz))
+        n = max(1, int(round(duration * hz)))
+        step_dt = duration / n
+        for i in range(1, n + 1):
+            t = i / n
+            lerped = [
+                [
+                    start[li][0] + (target[li][0] - start[li][0]) * t,
+                    start[li][1] + (target[li][1] - start[li][1]) * t,
+                    start[li][2] + (target[li][2] - start[li][2]) * t,
+                ]
+                for li in range(4)
+            ]
+            self._commit_coords(lerped, israise=israise)
+            if step_dt > 0:
+                time.sleep(step_dt)
 
     def current_step_all_leg_angle(self) -> list[float]:
         return list(self.servo_positions)

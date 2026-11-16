@@ -6,8 +6,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-import time
-from typing import Any
+from typing import Any, assert_never
 
 from ..brain.actions import (
     Action,
@@ -19,18 +18,42 @@ from ..brain.actions import (
     format_tool_call,
 )
 from ..brain.agent import Brain
-from ..concurrency import run_detached
 from ..config import Config
 from ..hal.interfaces import HAL
 from ..hal.sim.state import SimState
 from ..memory.store import MemoryStore
 from ..perception.tracker import FaceTracker
 from ..reflexes.loop import ReflexLoop
-from ..voice.stt import STTClient
-from ..voice.tts import TTSClient
+from ..voice.pipeline import VoiceSession
 from .bus import EventBus
 from .latency import LatencyTracker
 from .stdin_lines import StdinLines
+
+# SoftPicrawler / device gait: ~1 cycle ≈ 0.4 s (matches PicrawlerMotion.steps_for_duration).
+_SECS_PER_STEP = 0.4
+
+
+def _duration_for_move(action: MoveAction) -> float | None:
+    """Prefer explicit steps (counted strides) over duration_s."""
+    if action.steps is not None and action.steps > 0:
+        return float(action.steps) * _SECS_PER_STEP
+    return action.duration_s
+
+
+# One small body gesture per face, from the crawler's named actions. None of
+# them walks or turns the robot; each ends standing where it started.
+EMOTE_GESTURES: dict[str, tuple[str, ...]] = {
+    "happy": ("wave",),
+    "love": ("look up", "stand"),
+    "curious": ("look left", "look right", "stand"),
+    "surprised": ("look up", "stand"),
+    "confused": ("look right", "stand"),
+    "scared": ("look down", "stand"),
+    "sad": ("look down", "stand"),
+    "sleepy": ("look down", "stand"),
+    "angry": ("push up", "stand"),
+    "mischievous": ("look right", "look left", "stand"),
+}
 
 
 class App:
@@ -41,32 +64,28 @@ class App:
         brain: Brain,
         memory: MemoryStore,
         bus: EventBus,
-        stt: STTClient | None,
-        tts: TTSClient | None,
         log: logging.Logger | None = None,
+        *,
+        use_voice: bool = True,
     ) -> None:
         self.cfg = cfg
         self.hal = hal
         self.brain = brain
         self.memory = memory
         self.bus = bus
-        self.stt = stt
-        self.tts = tts
         self.log = log or logging.getLogger("shikigami.app")
         # SimHAL and SoftPicrawler both expose `.state` + `.dashboard`.
         self._ui_state: SimState | None = getattr(hal, "state", None)
         self._dashboard = getattr(hal, "dashboard", None)
         self._reflex: ReflexLoop | None = None
         self._reflex_task: asyncio.Task | None = None
-        self._play_queue: asyncio.Queue | None = None
-        self._player_task: asyncio.Task | None = None
-        self._tts_lock = asyncio.Lock()
-        self._turn_lock = asyncio.Lock()  # serialize mic / stdin / dashboard turns
-        self._streamed_say = False
+        self._turn_lock = asyncio.Lock()  # serialize stdin / dashboard turns
+        self._body_lock = asyncio.Lock()  # one body motion at a time: moves and gestures
+        self._posture = "stand"  # stand | sit | lie, as last asked for
+        self._gestures: set[asyncio.Task] = set()
         self._stop_event = asyncio.Event()
-        # silence-end → first PCM (mic turns only); see _mark_ttfa_start / _note_first_audio
-        self._ttfa_t0: float | None = None
-        self._ttfa_ms: float | None = None
+        self.voice: VoiceSession | None = None
+        self._use_voice = use_voice
 
     async def start(self) -> None:
         await self.hal.start()
@@ -75,8 +94,25 @@ class App:
             dash.on_submit = lambda line: asyncio.create_task(self._submit_text(line))
             dash.on_close = self.request_stop  # quit button / window X
             dash.on_mute_toggle = self.toggle_mic_mute
-        self._play_queue = asyncio.Queue()
-        self._player_task = asyncio.create_task(self._player())
+        if self._use_voice and self.brain is not None:
+            self.voice = VoiceSession(
+                self.cfg,
+                self.brain,
+                self.memory,
+                execute=self.execute,
+                expression=self.hal.expression,
+                moving=lambda: self.hal.motion.moving,
+                on_level=self._on_mic_level,
+                state=self._state_dict,
+                events=lambda: self.memory.recent_events(8),
+                note_tool_line=self._note_tool,
+                on_ui=self._set_sim_state,
+                on_heard=self._on_voice_heard,
+                log=logging.getLogger("shikigami.voice"),
+            )
+            await self.voice.start()
+            if self.voice.listening:
+                self._set_sim_state(status="idle", mic="idle")
         tracker = None
         if self.cfg.perception.track_faces:
             tracker = FaceTracker(
@@ -88,39 +124,34 @@ class App:
             )
         self._reflex = ReflexLoop(self.hal, self.bus, self.cfg.reflexes, tracker=tracker)
         self._reflex_task = asyncio.create_task(self._reflex.run())
+        listening = self.voice.listening if self.voice is not None else False
         self.log.info(
-            "app started (backend=%s, input=%s, stt=%s)",
+            "app started (backend=%s, input=%s, voice=%s)",
             self.hal.backend,
             self.cfg.sim.input,
-            "on" if self.stt else "off",
+            "listening" if listening else "text",
         )
-        await self.brain.warmup()  # keep-alive + cold-start removal for turn #1
+        if self.brain is not None:
+            await self.brain.warmup()
 
     def request_stop(self) -> None:
         """Ask the input loops to exit (dashboard quit button, window X, q key)."""
         self._stop_event.set()
 
     def toggle_mic_mute(self) -> None:
-        """Dashboard Mute / Ctrl+M — pause capture; text input still works."""
+        """Dashboard Mute / Ctrl+M — drop mic audio; typed text still works."""
         if self._ui_state is None:
             return
         muted = not self._ui_state.mic_muted
         self._ui_state.mic_muted = muted
         self.hal.audio.set_muted(muted)
+        if self.voice is not None:
+            self.voice.set_muted(muted)
         self._set_sim_state(mic="muted" if muted else "idle", mic_level=0.0)
         self.log.info("mic %s", "muted" if muted else "unmuted")
 
-    def _mic_is_muted(self) -> bool:
-        return self._ui_state is not None and self._ui_state.mic_muted
-
-    async def _wait_while_muted(self) -> bool:
-        """Block until unmuted. Returns False if stop was requested."""
-        self._set_sim_state(mic="muted", mic_level=0.0)
-        while self._mic_is_muted():
-            if self._stop_event.is_set():
-                return False
-            await asyncio.sleep(0.1)
-        return True
+    def _on_mic_level(self, level: float) -> None:
+        self._set_sim_state(mic_level=level)
 
     async def _race_stop(self, coro):
         """Await coro, but return None as soon as the stop event fires (cancelling coro)."""
@@ -136,64 +167,16 @@ class App:
         return None
 
     async def stop(self) -> None:
+        if self.voice is not None:
+            await self.voice.stop()
         if self._reflex:
             self._reflex.stop()
         if self._reflex_task:
             self._reflex_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reflex_task
-        if self._play_queue is not None:
-            self._play_queue.put_nowait(None)
-        if self._player_task:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._player_task
         await self.hal.stop()
         self.memory.close()
-
-    def _mark_ttfa_start(self) -> None:
-        """Start TTFA clock at VAD silence-end (before STT)."""
-        self._ttfa_t0 = time.perf_counter()
-        self._ttfa_ms = None
-
-    def _note_first_audio(self) -> None:
-        """Log silence-end → first PCM once per mic turn."""
-        if self._ttfa_t0 is None:
-            return
-        self._ttfa_ms = (time.perf_counter() - self._ttfa_t0) * 1000
-        self.log.info("ttfa %.0f ms", self._ttfa_ms)
-        self._ttfa_t0 = None
-
-    def _latency_summary(self, tracker: LatencyTracker) -> str:
-        summary = tracker.summary()
-        if self._ttfa_ms is not None:
-            return f"ttfa={self._ttfa_ms:.0f}ms {summary}"
-        return summary
-
-    async def _player(self) -> None:
-        while True:
-            item = await self._play_queue.get()
-            try:
-                if item is None:
-                    return
-                data, fmt = item
-                self._note_first_audio()
-                await self.hal.expression.speak_visual(True)
-                try:
-                    await self.hal.audio.play(data, fmt)
-                except Exception as exc:  # e.g. no audio device — don't kill the queue
-                    self.log.warning("audio play failed: %s", exc)
-                await self.hal.expression.speak_visual(False)
-            finally:
-                self._play_queue.task_done()
-
-    async def _synth_and_queue(self, text: str) -> None:
-        """TTS one sentence and enqueue it for in-order playback. Serialized by a lock
-        so queue order == sentence order, but runs in a worker thread (overlaps LLM)."""
-        assert self.tts is not None
-        async with self._tts_lock:
-            data, fmt = await run_detached(lambda: self.tts.synth(text))
-        if data:
-            await self._play_queue.put((data, fmt))
 
     def _state_dict(self) -> dict[str, Any]:
         state: dict[str, Any] = {
@@ -207,18 +190,25 @@ class App:
 
     def _set_sim_state(self, **kw: Any) -> None:
         if self._ui_state is not None:
-            for k, v in kw.items():
-                setattr(self._ui_state, k, v)
+            for key, value in kw.items():
+                setattr(self._ui_state, key, value)
 
     def _note_tool(self, action: Action) -> None:
         """Push every finalized tool call into logs + dashboard tool panel."""
         line = format_tool_call(action)
         self.log.info("tool %s", line)
-        self._note_tool_marker(line)
+        if self._ui_state is not None:
+            self._ui_state.append_tool(line)
 
     def _note_tool_marker(self, line: str) -> None:
         if self._ui_state is not None:
             self._ui_state.append_tool(line)
+
+    async def _on_voice_heard(self, text: str) -> None:
+        """Mic turn transcript: same dashboard breadcrumbs as a typed turn."""
+        heard = text if len(text) <= 48 else text[:47] + "…"
+        self._note_tool_marker(f"── turn · {heard} ──")
+        await self.bus.publish("heard", {"text": text})
 
     async def _submit_text(self, text: str) -> None:
         """Dashboard fire-and-forget entry: serialize via handle_text, log failures."""
@@ -228,82 +218,32 @@ class App:
             self.log.exception("dashboard turn failed: %s", exc)
 
     async def handle_text(self, text: str) -> None:
-        """One full turn: context -> streaming LLM -> actions -> HAL. Latency per stage.
-
-        Serialized by `_turn_lock` so mic / stdin / dashboard cannot overlap turns
-        (memory, TTS queue, SimState). move/emote/remember execute as soon as their
-        tool call finalizes (on_action); say-text is synthesized sentence-by-sentence
-        while the LLM streams (on_sentence) and played back in order from a queue.
-        """
+        """One typed turn. Mic turns enter the Pipecat pipeline on their own."""
         async with self._turn_lock:
             await self._handle_text_locked(text)
 
     async def _handle_text_locked(self, text: str) -> None:
-        tracker = LatencyTracker(self.log)
-        self._streamed_say = False
-        # text-input turns have no VAD clock; don't reuse a previous mic ttfa
-        if self._ttfa_t0 is None:
-            self._ttfa_ms = None
         self._set_sim_state(last_heard=text, status="thinking")
         heard = text if len(text) <= 48 else text[:47] + "…"
         self._note_tool_marker(f"── turn · {heard} ──")
         await self.bus.publish("heard", {"text": text})
-        with tracker.stage("context"):
-            events = self.memory.recent_events(8)
-            state = self._state_dict()
+        if self.voice is None:
+            self._set_sim_state(status="idle")
+            return
+        await self.voice.submit_text(text)
+        self._set_sim_state(status="idle", last_latency=self.voice.last_summary)
 
-        noted = 0
-
-        async def on_action(action) -> None:
-            nonlocal noted
-            self._note_tool(action)
-            noted += 1
-            if not isinstance(action, SayAction):  # say is spoken via streamed sentences
-                await self.execute(action, tracker)
-
-        pending_tts: list[asyncio.Task] = []
-
-        async def on_sentence(sentence: str) -> None:
-            if self.tts is not None:
-                # set now, not in the task — avoids a skip race at turn end
-                self._streamed_say = True
-                pending_tts.append(asyncio.create_task(self._synth_and_queue(sentence)))
-
-        with tracker.stage("llm"):
-            result = await self.brain.respond(
-                text, events, state, on_action=on_action, on_sentence=on_sentence
-            )
-        # Plain-content fallback SayActions never went through on_action.
-        for action in result.actions[noted:]:
-            self._note_tool(action)
-        await asyncio.gather(*pending_tts)  # all sentences synthesized+queued before measuring play
-        for action in result.actions:
-            if isinstance(action, SayAction) and self._streamed_say:
-                continue  # already spoken via streamed sentences
-            await self.execute(action, tracker)
-        self.memory.log_event(
-            "turn",
-            {
-                "input": text,
-                "reply": result.reply,
-                "actions": [a.type.value for a in result.actions],
-            },
-        )
-        with tracker.stage("play"):
-            await self._play_queue.join()  # wait until queued speech finished playing
-        summary = self._latency_summary(tracker)
-        self._set_sim_state(status="idle", last_latency=summary)
-        self.log.info("turn done — latency %s", summary)
-
-    async def execute(self, action, tracker: LatencyTracker) -> None:
+    async def execute(self, action, tracker: LatencyTracker | None = None) -> None:
+        tracker = tracker or LatencyTracker(self.log)
         if isinstance(action, MoveAction):
             with tracker.stage("exec:move"):
                 await self._exec_move(action)
         elif isinstance(action, SayAction):
-            await self._exec_say(action, tracker)
+            self.log.info("say: %s", action.text)
         elif isinstance(action, EmoteAction):
             with tracker.stage("exec:emote"):
                 await self.hal.expression.emote(action.name)
+            self._start_gesture(action.name)
         elif isinstance(action, RememberAction):
             with tracker.stage("exec:remember"):
                 self.memory.remember(action.key, action.value)
@@ -311,54 +251,100 @@ class App:
         elif isinstance(action, IdleAction):
             with tracker.stage("exec:idle"):
                 await asyncio.sleep(min(action.seconds, 30.0))
-
-    async def _exec_move(self, a: MoveAction) -> None:
-        m = self.hal.motion
-        if a.motion == "walk":
-            await m.walk(a.direction, a.speed, a.duration_s)
-        elif a.motion == "turn":
-            await m.turn(a.direction, a.angle_deg, a.speed)
-        elif a.motion == "sit":
-            await m.sit()
-        elif a.motion == "stand":
-            await m.stand()
-        elif a.motion == "lie":
-            await m.lie()
-        elif a.motion == "wag":
-            await m.wag(a.duration_s)
-        elif a.motion == "look_at":
-            await m.look_at(0.0, 0.0)
-        elif a.motion == "stop":
-            await m.stop()
         else:
-            await m.play_action(a.motion)
+            assert_never(action)
 
-    async def _exec_say(self, a: SayAction, tracker: LatencyTracker) -> None:
-        self.log.info("say: %s", a.text)
-        data, fmt = b"", "none"
-        if self.tts is not None:
-            with tracker.stage("tts"):
-                data, fmt = await run_detached(lambda: self.tts.synth(a.text))
-        if data:
-            self._note_first_audio()
-            await self.hal.expression.speak_visual(True)
-            with tracker.stage("play"):
-                await self.hal.audio.play(data, fmt)
-            await self.hal.expression.speak_visual(False)
+    def _start_gesture(self, emote: str) -> None:
+        """Play the face's body gesture in the background, if the body is free.
+
+        Skipped while the robot moves, sits, or lies, and while another gesture
+        runs: a gesture must never fight a move the human asked for.
+        """
+        steps = EMOTE_GESTURES.get(emote.lower().strip())
+        if (
+            not steps
+            or not self.cfg.reflexes.emote_gestures
+            or self._posture != "stand"
+            or self.hal.motion.moving
+            or self._body_lock.locked()
+        ):
+            return
+        task = asyncio.create_task(self._run_gesture(steps), name=f"gesture-{emote}")
+        self._gestures.add(task)
+        task.add_done_callback(self._gestures.discard)
+
+    async def _run_gesture(self, steps: tuple[str, ...]) -> None:
+        motion = self.hal.motion
+        try:
+            async with self._body_lock:
+                for step in steps:
+                    if step == "stand":
+                        await motion.stand()
+                    else:
+                        await motion.play_action(step)
+        except Exception as exc:
+            self.log.warning("gesture %s failed: %s", "/".join(steps), exc)
+
+    async def _exec_move(self, action: MoveAction) -> None:
+        # A gesture in flight finishes first; it is short and ends standing.
+        async with self._body_lock:
+            await self._exec_move_locked(action)
+        if action.motion in ("sit", "lie"):
+            self._posture = action.motion
+        elif action.motion != "look_at":
+            self._posture = "stand"
+
+    async def _exec_move_locked(self, action: MoveAction) -> None:
+        motion = self.hal.motion
+        duration_s = _duration_for_move(action)
+        match action.motion:
+            case "walk" | "forward" | "backward":
+                direction = (
+                    "backward"
+                    if action.motion == "backward" or action.direction in ("back", "backward")
+                    else "forward"
+                )
+                await motion.walk(direction, action.speed, duration_s)
+            case "turn" | "turn_left" | "turn_right":
+                direction = (
+                    "left"
+                    if action.motion == "turn_left"
+                    else "right"
+                    if action.motion == "turn_right"
+                    else action.direction
+                )
+                await motion.turn(direction, action.angle_deg, action.speed)
+            case "sit":
+                await motion.sit()
+            case "stand":
+                await motion.stand()
+            case "lie":
+                await motion.lie()
+            case "wag":
+                await motion.wag(duration_s)
+            case "look_at":
+                await motion.look_at(0.0, 0.0)
+            case "stop":
+                await motion.stop()
+            case other:
+                await motion.play_action(other)
 
     async def run(self) -> None:
-        if self.cfg.sim.input == "mic" and self.stt is None:
-            self.log.warning(
-                "sim.input=mic but stt is disabled — falling back to text input (use --mic)"
+        listening = self.voice is not None and self.voice.listening
+        if self.cfg.sim.input == "mic" and not listening:
+            self.log.warning("sim.input=mic but the voice pipeline is not listening — text input")
+            print("shikigami — type a line + Enter (Ctrl-D to quit, Quit/Esc in the dashboard).")
+        elif listening:
+            print(
+                "shikigami — listening (Ctrl-C to quit). "
+                "Mute with the dashboard button or Ctrl+M. Type in the chat field or here."
             )
-        if self.cfg.sim.input == "mic" and self.stt is not None:
-            await self._run_mic()
         else:
-            await self._run_text()
+            print("shikigami — type a line + Enter (Ctrl-D to quit, Quit/Esc in the dashboard).")
+            print("note: you can also type in the dashboard chat field (Enter submits).")
+        await self._run_text()
 
     async def _run_text(self) -> None:
-        print("shikigami sim — type a line + Enter (Ctrl-D to quit, Quit/Esc in the dashboard).")
-        print("note: you can also type in the dashboard chat field (Enter submits).")
         print("you> ", end="", flush=True)
         lines = StdinLines(sys.stdin.fileno())
         try:
@@ -374,55 +360,3 @@ class App:
                     print("you> ", end="", flush=True)
         finally:
             lines.close()
-
-    async def _listen_once(self) -> str:
-        """Record one utterance (VAD) and transcribe it; '' on silence. Stages timed."""
-        tracker = LatencyTracker(self.log)
-        self._set_sim_state(mic="listening…")
-        with tracker.stage("record"):
-            wav = await self.hal.audio.record()
-        if not wav:
-            # no speech (or silent mic) — skip the STT round-trip
-            self._set_sim_state(mic="idle", mic_level=0.0)
-            self.log.info("listen — latency %s (no speech)", tracker.summary())
-            return ""
-        # VAD just closed the utterance — TTFA runs until first PCM out
-        self._mark_ttfa_start()
-        self._set_sim_state(mic="transcribing…", mic_level=0.0)
-        with tracker.stage("stt"):
-            text = await run_detached(lambda: self.stt.transcribe(wav))
-        self._set_sim_state(mic="idle", last_heard=text or "(stt empty)")
-        self.log.info("listen — latency %s", tracker.summary())
-        return text
-
-    async def _run_mic(self) -> None:
-        assert self.stt is not None
-        print("shikigami sim — listening on the mic (Ctrl-C to quit, Quit/Esc in the dashboard).")
-        print("Mute mic via the dashboard button or Ctrl+M; type in the chat field anytime.")
-        print("watch Mic + Level in the dashboard side panel.")
-        while True:
-            if self._mic_is_muted():
-                if not await self._race_stop(self._wait_while_muted()):
-                    return
-                continue
-            try:
-                text = await self._race_stop(self._listen_once())
-            except Exception as exc:
-                self.log.warning(
-                    "mic/STT failed (%s) — falling back to text input "
-                    "(on macOS: `brew install portaudio`, then `uv sync --extra sim`)",
-                    exc,
-                )
-                await self._run_text()
-                return
-            if text is None:  # stop requested (window closed / quit button)
-                return
-            if self._mic_is_muted():
-                # Mute aborted mid-listen — don't treat as a failed utterance.
-                continue
-            if text:
-                await self.handle_text(text)
-            else:
-                self.log.info(
-                    "heard nothing usable — speak longer/clearer, or check data/last-mic.wav"
-                )

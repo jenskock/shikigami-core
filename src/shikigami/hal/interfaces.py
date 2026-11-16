@@ -76,7 +76,7 @@ class Camera(abc.ABC):
 class Audio(abc.ABC):
     @abc.abstractmethod
     async def record(self, max_s: float = 8.0, silence_s: float = 1.2) -> bytes:
-        """Record mic audio with VAD; returns WAV bytes."""
+        """Legacy capture hook. The Pipecat transport owns the mic and this returns empty WAV."""
         ...
 
     @abc.abstractmethod

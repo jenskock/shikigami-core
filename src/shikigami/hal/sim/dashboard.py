@@ -69,6 +69,14 @@ QPlainTextEdit#tools {{
   padding: 6px 8px; color: {_TEXT}; font-family: Menlo, Monaco, monospace;
   font-size: 11px;
 }}
+QComboBox#speed {{
+  background: {_FIELD}; border: 1px solid {_BORDER}; border-radius: 6px;
+  padding: 4px 8px; color: {_TEXT}; min-width: 72px;
+}}
+QComboBox#speed::drop-down {{ border: none; }}
+QComboBox#speed QAbstractItemView {{
+  background: {_FIELD}; color: {_TEXT}; selection-background-color: {_ACCENT};
+}}
 """
 
 
@@ -91,6 +99,7 @@ class SimDashboard:
         self._mute_btn: Any | None = None
         self._labels: dict[str, Any] = {}
         self._body_view: BodyView | None = None
+        self._speed_combo: Any | None = None
         self._tools_view: Any | None = None
         self._tools_len: int = -1
         self.state: SimState | None = None
@@ -136,6 +145,7 @@ class SimDashboard:
             from PySide6.QtCore import Qt
             from PySide6.QtWidgets import (
                 QApplication,
+                QComboBox,
                 QFrame,
                 QHBoxLayout,
                 QLabel,
@@ -265,10 +275,23 @@ class SimDashboard:
             body_l = QVBoxLayout(body)
             body_l.setContentsMargins(16, 16, 16, 16)
             body_l.setSpacing(8)
+            body_header = QHBoxLayout()
             body_title = QLabel("BODY")
             body_title.setObjectName("section")
-            body_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            body_l.addWidget(body_title, 0, Qt.AlignmentFlag.AlignHCenter)
+            body_header.addWidget(body_title, 0, Qt.AlignmentFlag.AlignVCenter)
+            body_header.addStretch(1)
+            speed_label = QLabel("Speed")
+            speed_label.setObjectName("muted")
+            body_header.addWidget(speed_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            speed = QComboBox()
+            speed.setObjectName("speed")
+            for label, value in (("0.25×", 0.25), ("0.5×", 0.5), ("1×", 1.0), ("2×", 2.0)):
+                speed.addItem(label, value)
+            speed.setCurrentIndex(2)  # 1×
+            speed.currentIndexChanged.connect(self._on_playback_speed)
+            self._speed_combo = speed
+            body_header.addWidget(speed, 0, Qt.AlignmentFlag.AlignVCenter)
+            body_l.addLayout(body_header)
             self._body_view = BodyView()
             self._body_view.setMinimumHeight(200)
             body_l.addWidget(self._body_view, 1)
@@ -313,10 +336,15 @@ class SimDashboard:
             self._log.warning("cannot open dashboard (%s) — log-only mode", exc)
 
     async def _pump_loop(self) -> None:
-        """Keep Qt responsive (typing, resize, quit) independent of reflex/camera cost."""
+        """Keep Qt responsive and BODY pose at ~display rate during soft gait."""
         try:
             while not self._closed and self._app is not None:
                 self.pump()
+                # SoftPicrawler publishes poses on a worker thread; sync here so
+                # interpolated frames paint even when the reflex loop is slower.
+                st = self.state
+                if st is not None:
+                    self._sync_body(st)
                 await asyncio.sleep(_PUMP_DT_S)
         except asyncio.CancelledError:
             raise
@@ -411,11 +439,26 @@ class SimDashboard:
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+    def _on_playback_speed(self, _index: int = 0) -> None:
+        combo = self._speed_combo
+        st = self.state
+        if combo is None or st is None:
+            return
+        value = combo.currentData()
+        if value is None:
+            return
+        st.playback_speed = float(value)
+
     def _sync_body(self, st: SimState) -> None:
         view = self._body_view
         if view is None:
             return
-        view.set_pose(st.leg_coords)
+        view.set_pose(
+            st.leg_coords,
+            body_x=st.body_x,
+            body_y=st.body_y,
+            body_yaw_deg=st.body_yaw_deg,
+        )
 
     def _push_images(self) -> None:
         if self._face_dirty and self._face_label is not None:

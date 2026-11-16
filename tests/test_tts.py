@@ -1,59 +1,117 @@
-"""TTS providers: piper-http posts to the remote Piper server; none disables."""
+"""piper-http URL probe. The GPL piper package is not imported."""
 
-import httpx
+import asyncio
+import io
+import wave
+
 import pytest
 from pydantic import ValidationError
 
-from shikigami.config import TTSConfig
-from shikigami.voice.tts import TTSClient
+from shikigami.config import TTSConfig, load_config
+from shikigami.voice.pipeline import build_tts
+from shikigami.voice.piper_http import PiperHttpTTSService, candidate_urls
 
 
-class _Resp:
-    def __init__(self, content=b"wav-bytes", status_code=200):
-        self.content = content
-        self.status_code = status_code
-
-    def raise_for_status(self):
-        pass
-
-
-def _patch_post(monkeypatch, routes):
-    """routes: path -> status code; returns list of requested urls."""
-    calls = []
-
-    def fake_post(url, json=None, timeout=None):
-        calls.append((url, json, timeout))
-        path = url.split("/", 3)[3]  # strip scheme+host
-        return _Resp(status_code=routes.get("/" + path, 404))
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    return calls
+def _wav(sample_rate: int = 22050) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(b"\x00\x01" * 20)
+    return buf.getvalue()
 
 
-def test_piper_http_autodetects_synthesize_1_8(monkeypatch):
-    calls = _patch_post(monkeypatch, {"/api/tts": 404, "/synthesize": 200})
-    tts = TTSClient(TTSConfig(provider="piper-http", base_url="http://jesktop:5000/", timeout_s=7))
-    data, fmt = tts.synth("hello there")
-    assert data == b"wav-bytes" and fmt == "wav"
-    assert calls[-1][0] == "http://jesktop:5000/synthesize"
-    assert calls[-1][1] == {"text": "hello there"}
-    assert calls[-1][2] == 7
-    # second call reuses the discovered path (no more probing)
-    tts.synth("again")
-    assert calls[-1][0].endswith("/synthesize")
+class _Response:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    async def read(self) -> bytes:
+        return self._body
+
+    async def text(self) -> str:
+        return self._body.decode("utf-8", "replace")
+
+    @property
+    def content(self):
+        body = self._body
+
+        class _Content:
+            def iter_chunked(self, _size):
+                async def _gen():
+                    yield body
+
+                return _gen()
+
+        return _Content()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
 
 
-def test_piper_http_legacy_api_tts_1_3(monkeypatch):
-    calls = _patch_post(monkeypatch, {"/api/tts": 200})
-    tts = TTSClient(TTSConfig(provider="piper-http", base_url="http://localhost:5000"))
-    data, _ = tts.synth("hallo")
-    assert data == b"wav-bytes"
-    assert calls[-1][0] == "http://localhost:5000/api/tts"
+class _Session:
+    def __init__(self, routes: dict[str, int]):
+        self.routes = routes
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        del headers, timeout
+        self.calls.append((url, json))
+        path = "/" + url.split("/", 3)[3]
+        status = self.routes.get(path, 404)
+        body = _wav() if status == 200 else b"missing"
+        return _Response(status, body)
 
 
-def test_none_provider_returns_empty():
-    tts = TTSClient(TTSConfig(provider="none"))
-    assert tts.synth("hi") == (b"", "none")
+def test_candidate_urls_probe_both_paths():
+    assert candidate_urls("http://jesktop:5000/") == [
+        "http://jesktop:5000/synthesize",
+        "http://jesktop:5000/api/tts",
+    ]
+    assert candidate_urls("http://jesktop:5000/synthesize") == ["http://jesktop:5000/synthesize"]
+
+
+def test_piper_http_autodetects_synthesize_and_reuses_it():
+    session = _Session({"/api/tts": 404, "/synthesize": 200})
+    service = PiperHttpTTSService(
+        base_url="http://jesktop:5000/",
+        aiohttp_session=session,  # type: ignore[arg-type]
+        timeout_s=7,
+    )
+    service._sample_rate = 22050
+
+    async def run() -> bytes:
+        frames = [frame async for frame in service.run_tts("hello there", "ctx")]
+        await service.run_tts("again", "ctx2").__anext__()
+        return b"".join(frame.audio for frame in frames)
+
+    audio = asyncio.run(run())
+    assert audio
+    assert session.calls[0][0].endswith("/synthesize") or session.calls[0][0].endswith("/api/tts")
+    assert session.calls[0][1] == {"text": "hello there"}
+    assert session.calls[-1][0].endswith("/synthesize")
+    assert session.calls[-1][1] == {"text": "again"}
+    assert sum(url.endswith("/api/tts") for url, _payload in session.calls) == 0
+
+
+def test_piper_http_legacy_api_tts():
+    session = _Session({"/api/tts": 200, "/synthesize": 404})
+    service = PiperHttpTTSService(
+        base_url="http://localhost:5000",
+        aiohttp_session=session,  # type: ignore[arg-type]
+    )
+    service._sample_rate = 16000
+    frames = asyncio.run(_collect(service))
+    assert frames
+    assert session.calls[-1][0] == "http://localhost:5000/api/tts"
+
+
+async def _collect(service: PiperHttpTTSService):
+    return [frame async for frame in service.run_tts("hallo", "ctx")]
 
 
 def test_response_format_rejects_non_wav():
@@ -61,19 +119,9 @@ def test_response_format_rejects_non_wav():
         TTSConfig(response_format="mp3")
 
 
-def test_openai_synth_always_requests_wav(monkeypatch):
-    seen = {}
-
-    class _Speech:
-        def create(self, **kw):
-            seen.update(kw)
-            return type("R", (), {"content": b"RIFF"})()
-
-    class _Client:
-        audio = type("A", (), {"speech": _Speech()})()
-
-    tts = TTSClient(TTSConfig(provider="openai", model="tts-1", voice="alloy"))
-    monkeypatch.setattr(tts, "_get_client", lambda: _Client())
-    data, fmt = tts.synth("hi")
-    assert data == b"RIFF" and fmt == "wav"
-    assert seen["response_format"] == "wav"
+def test_in_process_piper_is_refused():
+    cfg = load_config()
+    cfg.tts.provider = "piper"
+    cfg.tts.enabled = True
+    with pytest.raises(RuntimeError, match="GPL"):
+        build_tts(cfg, session=None)

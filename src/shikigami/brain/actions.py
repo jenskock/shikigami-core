@@ -38,6 +38,7 @@ class MoveAction(BaseModel):
     direction: str = "forward"  # forward|back|left|right
     speed: float = 0.5
     duration_s: float | None = None
+    steps: int | None = None  # gait cycles for walk/turn (e.g. "3 Schritte" → 3)
     angle_deg: float | None = None
 
 
@@ -48,7 +49,7 @@ class SayAction(BaseModel):
 
 class EmoteAction(BaseModel):
     type: Literal[ActionType.EMOTE] = ActionType.EMOTE
-    name: str
+    name: str = "neutral"  # models sometimes omit name; neutral is the honest default
 
 
 class RememberAction(BaseModel):
@@ -75,7 +76,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "move",
-            "description": "Move the body: walk, turn, sit, stand, lie, wag, look_at, stop, ...",
+            "description": (
+                "Actually move the robot body. Required whenever the human asks "
+                "for a physical action (walk/laufen, turn/drehen, dance/tanzen, "
+                "sit, stand, wave, …). Speech alone does nothing — call this tool."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -100,13 +105,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "turn_right",
                         ],
                         "description": (
-                            "High-level body verb, or a named gait/action "
-                            "(dance/wave/push_up/…) when the backend supports it."
+                            "Body verb. Use dance for tanzen/dance (never walk). "
+                            "Use walk/forward/backward for walking. "
+                            "Use turn_left/turn_right or turn+direction for turning."
                         ),
                     },
                     "direction": {"type": "string", "enum": ["forward", "back", "left", "right"]},
                     "speed": {"type": "number", "minimum": 0, "maximum": 1},
-                    "duration_s": {"type": "number", "minimum": 0},
+                    "duration_s": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Optional seconds. Prefer steps for counted strides.",
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Gait cycles for walk/turn. '3 Schritte' / 'three steps' → steps=3."
+                        ),
+                    },
                     "angle_deg": {"type": "number"},
                 },
                 "required": ["motion"],
@@ -116,20 +133,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "say",
-            "description": "Speak a short, in-character reply out loud.",
-            "parameters": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "emote",
-            "description": "Show a facial/expression animation.",
+            "description": (
+                "Set the face. Pick the one that fits this exact moment, not a favourite. "
+                "neutral: plain facts, listening, nothing special. happy: really pleased, "
+                "praised, greeted. love: affection, being petted, thanked. curious: a "
+                "question, something new, being asked to look. surprised: unexpected news. "
+                "scared: danger, being startled or asked to be scared. sad: bad news, "
+                "sorry, left alone. angry: told off, annoyed, playfully grumpy. sleepy: "
+                "tired, bedtime, lying down. confused: did not understand. focused: "
+                "concentrating on a task, walking, counting. mischievous: joking, teasing, "
+                "tricks, dancing. Defaults to neutral."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -151,7 +166,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         ],
                     }
                 },
-                "required": ["name"],
+                "required": [],
             },
         },
     },

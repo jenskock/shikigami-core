@@ -17,6 +17,8 @@ _EYE_FIELDS = (
     "top_lid_angle",
     "top_lid_coverage",
     "bottom_lid_coverage",
+    "bottom_lid_curve",
+    "pupil_scale",
     "pupil_offset_x",
     "pupil_offset_y",
     "highlight_offset_x",

@@ -44,79 +44,108 @@ _VA: dict[Emotion, tuple[float, float]] = {
 
 @dataclass(frozen=True, slots=True)
 class EmotionTarget:
-    """Target geometry for a named emotion (left/right may differ for brows)."""
+    """Target geometry for a named emotion (left/right may differ for brows).
+
+    ``tint`` pulls the eye color towards an RGB value (love goes pink, angry red).
+    """
 
     left: EyeState
     right: EyeState
     gap: float = 1.0
+    tint: tuple[int, int, int] | None = None
 
 
 def _eye(
     *,
     width: float = 1.0,
     height: float = 1.0,
-    corner: float = 0.85,
-    top: float = 0.05,
-    bottom: float = 0.08,
+    corner: float = 0.6,
+    top: float = 0.0,
+    bottom: float = 0.0,
+    curve: float = 0.0,
     angle: float = 0.0,
     scale: float = 1.0,
+    pupil: float = 1.0,
+    y: float = 0.0,
 ) -> EyeState:
     return EyeState(
+        y=y,
         width=width,
         height=height,
         corner_radius=corner,
         top_lid_coverage=top,
         bottom_lid_coverage=bottom,
+        bottom_lid_curve=curve,
         top_lid_angle=angle,
         scale=scale,
+        pupil_scale=pupil,
     )
 
 
-def _sym(eye: EyeState, gap: float = 1.0) -> EmotionTarget:
-    return EmotionTarget(left=eye.copy(), right=eye.copy(), gap=gap)
+def _sym(
+    eye: EyeState, gap: float = 1.0, tint: tuple[int, int, int] | None = None
+) -> EmotionTarget:
+    return EmotionTarget(left=eye.copy(), right=eye.copy(), gap=gap, tint=tint)
+
+
+def _brows(eye: EyeState, angle: float, gap: float = 1.0, tint=None) -> EmotionTarget:
+    """Mirror a brow angle: the left eye gets ``angle``, the right eye its opposite."""
+    left, right = eye.copy(), eye.copy()
+    left.top_lid_angle = angle
+    right.top_lid_angle = -angle
+    return EmotionTarget(left=left, right=right, gap=gap, tint=tint)
 
 
 def _presets() -> dict[Emotion, EmotionTarget]:
+    # Each face has to read at a glance on a 240 px round display, so every
+    # preset differs from the others in silhouette, not just by a few percent.
     return {
-        Emotion.NEUTRAL: _sym(_eye()),
-        Emotion.HAPPY: _sym(_eye(width=1.06, height=0.82, corner=0.9, top=0.08, bottom=0.42), 0.96),
-        Emotion.SAD: EmotionTarget(
-            left=_eye(width=1.0, height=0.9, top=0.38, bottom=0.06, angle=-12.0),
-            right=_eye(width=1.0, height=0.9, top=0.38, bottom=0.06, angle=12.0),
-            gap=0.98,
+        Emotion.NEUTRAL: _sym(_eye(top=0.04, bottom=0.03)),
+        # Smiling arcs, no pupil: the cheek pushes the lower lid up in the middle.
+        Emotion.HAPPY: _sym(
+            _eye(width=1.05, height=0.95, corner=0.8, bottom=0.45, curve=1.0, pupil=0.0), 0.98
         ),
-        Emotion.ANGRY: EmotionTarget(
-            left=_eye(width=1.02, height=0.88, top=0.28, bottom=0.12, angle=18.0, corner=0.7),
-            right=_eye(width=1.02, height=0.88, top=0.28, bottom=0.12, angle=-18.0, corner=0.7),
-            gap=0.94,
+        # Outer corners drop, eyes sink.
+        Emotion.SAD: _brows(_eye(height=0.85, top=0.4, y=0.14, pupil=1.05), -17.0),
+        # Brows slam down towards the nose.
+        Emotion.ANGRY: _brows(
+            _eye(height=0.85, corner=0.4, top=0.42, bottom=0.1, pupil=0.85),
+            21.0,
+            0.94,
+            (255, 90, 70),
         ),
-        Emotion.SURPRISED: _sym(
-            _eye(width=0.94, height=1.32, corner=0.75, top=0.0, bottom=0.0), 1.14
-        ),
-        Emotion.SLEEPY: _sym(
-            _eye(width=1.12, height=0.38, corner=0.95, top=0.55, bottom=0.5), 0.94
-        ),
-        Emotion.CURIOUS: _sym(
-            _eye(width=0.96, height=1.18, corner=0.8, top=0.0, bottom=0.05), 1.06
-        ),
-        Emotion.LOVE: _sym(
-            _eye(width=1.08, height=0.95, corner=0.92, top=0.1, bottom=0.28), 0.98
-        ),
-        Emotion.CONFUSED: EmotionTarget(
-            left=_eye(width=0.98, height=1.05, top=0.12, bottom=0.1, angle=-8.0),
-            right=_eye(width=1.05, height=1.15, top=0.02, bottom=0.05, angle=14.0),
+        Emotion.SURPRISED: _sym(_eye(height=1.25, corner=0.8, scale=1.08, pupil=0.6), 1.1),
+        # Heavy upper lids, sagging outer corners.
+        Emotion.SLEEPY: _brows(_eye(width=1.05, height=0.8, top=0.62, y=0.1), -5.0, 0.97),
+        # One eye bigger than the other, like a tilted head.
+        Emotion.CURIOUS: EmotionTarget(
+            left=_eye(height=0.95, top=0.06, pupil=1.1),
+            right=_eye(height=1.2, scale=1.08, pupil=1.15),
             gap=1.04,
         ),
+        Emotion.LOVE: _sym(
+            _eye(width=1.05, corner=0.85, bottom=0.3, curve=0.8, pupil=1.35),
+            0.98,
+            (255, 150, 200),
+        ),
+        # One brow down, the other eye wide.
+        Emotion.CONFUSED: EmotionTarget(
+            left=_eye(height=0.9, top=0.32, angle=-11.0, pupil=0.9),
+            right=_eye(height=1.15, scale=1.05, pupil=0.9),
+            gap=1.04,
+        ),
+        # Tall, narrow, pinpoint pupils, eyes apart.
         Emotion.SCARED: _sym(
-            _eye(width=0.9, height=1.25, corner=0.7, top=0.0, bottom=0.0, scale=0.95),
-            1.18,
+            _eye(width=0.85, height=1.2, corner=0.75, scale=0.94, pupil=0.45), 1.16
         ),
+        # A narrow, level slit.
         Emotion.FOCUSED: _sym(
-            _eye(width=0.92, height=0.85, corner=0.65, top=0.18, bottom=0.15), 0.9
+            _eye(height=0.75, corner=0.35, top=0.26, bottom=0.2, pupil=0.9), 0.93
         ),
+        # A smirk: one brow down, both cheeks up.
         Emotion.MISCHIEVOUS: EmotionTarget(
-            left=_eye(width=1.04, height=0.78, top=0.15, bottom=0.35, angle=10.0),
-            right=_eye(width=1.04, height=0.78, top=0.22, bottom=0.3, angle=-6.0),
+            left=_eye(height=0.9, top=0.36, bottom=0.24, curve=0.6, angle=15.0),
+            right=_eye(height=0.95, top=0.1, bottom=0.3, curve=0.6, angle=-4.0),
             gap=0.97,
         ),
     }
@@ -128,7 +157,7 @@ _PRESETS = _presets()
 def emotion_targets(name: str | Emotion) -> EmotionTarget:
     key = Emotion(name) if not isinstance(name, Emotion) else name
     src = _PRESETS[key]
-    return EmotionTarget(left=src.left.copy(), right=src.right.copy(), gap=src.gap)
+    return EmotionTarget(left=src.left.copy(), right=src.right.copy(), gap=src.gap, tint=src.tint)
 
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -145,6 +174,8 @@ def _lerp_eye(a: EyeState, b: EyeState, t: float) -> EyeState:
         top_lid_angle=_lerp(a.top_lid_angle, b.top_lid_angle, t),
         top_lid_coverage=_lerp(a.top_lid_coverage, b.top_lid_coverage, t),
         bottom_lid_coverage=_lerp(a.bottom_lid_coverage, b.bottom_lid_coverage, t),
+        bottom_lid_curve=_lerp(a.bottom_lid_curve, b.bottom_lid_curve, t),
+        pupil_scale=_lerp(a.pupil_scale, b.pupil_scale, t),
         pupil_offset_x=_lerp(a.pupil_offset_x, b.pupil_offset_x, t),
         pupil_offset_y=_lerp(a.pupil_offset_y, b.pupil_offset_y, t),
         highlight_offset_x=_lerp(a.highlight_offset_x, b.highlight_offset_x, t),
@@ -173,6 +204,7 @@ def blend_emotions(weights: dict[str, float]) -> EmotionTarget:
         corner_radius=0,
         top_lid_coverage=0,
         bottom_lid_coverage=0,
+        pupil_scale=0,
         scale=0,
         color_r=0,
         color_g=0,
@@ -201,6 +233,8 @@ def _add_eye(acc: EyeState, src: EyeState, w: float) -> EyeState:
         top_lid_angle=acc.top_lid_angle + src.top_lid_angle * w,
         top_lid_coverage=acc.top_lid_coverage + src.top_lid_coverage * w,
         bottom_lid_coverage=acc.bottom_lid_coverage + src.bottom_lid_coverage * w,
+        bottom_lid_curve=acc.bottom_lid_curve + src.bottom_lid_curve * w,
+        pupil_scale=acc.pupil_scale + src.pupil_scale * w,
         pupil_offset_x=acc.pupil_offset_x + src.pupil_offset_x * w,
         pupil_offset_y=acc.pupil_offset_y + src.pupil_offset_y * w,
         highlight_offset_x=acc.highlight_offset_x + src.highlight_offset_x * w,
@@ -237,4 +271,5 @@ def scale_intensity(base: EmotionTarget, intensity: float) -> EmotionTarget:
         left=_lerp_eye(neu.left, base.left, t),
         right=_lerp_eye(neu.right, base.right, t),
         gap=_lerp(neu.gap, base.gap, t),
+        tint=base.tint,
     )

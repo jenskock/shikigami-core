@@ -169,3 +169,69 @@ def test_draw_frame_has_white_pixels():
     rgb = draw_frame_rgb(eng.frame, 480, 560)
     assert rgb[250:310, 90:170].max() > 200  # bright white eye body
     assert rgb.mean() > 1.0
+
+
+def _settled(name: str) -> EyesEngine:
+    eng = EyesEngine(EyesConfig(seed=5, blink_rate_per_min=0.01))
+    eng.life._next_blink_s = 1e9
+    eng.set_emotion(name)
+    for _ in range(120):
+        eng.update(1 / 60)
+    return eng
+
+
+def test_every_emotion_draws_a_different_face():
+    """No two emotes may look alike, and none may vanish (sleepy used to)."""
+    from shikigami.expression.eyes.render.numpy_draw import draw_frame_rgb
+
+    faces = {}
+    for emo in Emotion:
+        rgb = draw_frame_rgb(_settled(emo.value).frame, 240, 240).astype(int)
+        lit = (rgb.max(axis=2) > 120).sum()
+        assert lit > 600, f"{emo.value} is barely visible ({lit} px)"
+        faces[emo.value] = rgb
+    names = list(faces)
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            changed = (abs(faces[a] - faces[b]).max(axis=2) > 80).sum()
+            assert changed > 500, f"{a} and {b} look the same ({changed} px differ)"
+
+
+def test_brow_angle_is_a_real_slope():
+    from shikigami.expression.eyes.render.numpy_draw import draw_frame_rgb
+
+    rgb = draw_frame_rgb(_settled("angry").frame, 240, 240)
+    lit = rgb.max(axis=2) > 120
+    left_eye = lit[:, :120]
+    cols = [c for c in range(120) if left_eye[:, c].any()]
+    outer_top = left_eye[:, cols[3]].argmax()
+    inner_top = left_eye[:, cols[-4]].argmax()
+    assert inner_top - outer_top >= 8  # the lid drops towards the nose
+
+
+def test_emotions_tint_and_move():
+    angry = _settled("angry").frame.left
+    assert angry.color_r > angry.color_b + 60  # red, not the configured blue
+    love = _settled("love").frame.left
+    assert love.color_r > love.color_g
+    neutral = _settled("neutral").frame.left
+    assert (neutral.color_r, neutral.color_g, neutral.color_b) == (255, 255, 255)
+
+    eng = _settled("scared")
+    xs = [eng.update(1 / 60).left.x for _ in range(30)]
+    assert max(xs) - min(xs) > 0.03  # trembling
+    calm = _settled("neutral")
+    xs = [calm.update(1 / 60).left.x for _ in range(30)]
+    assert max(xs) - min(xs) < 1e-6
+
+
+def test_new_emotion_arrives_with_a_pop():
+    eng = _settled("neutral")
+    before = eng.frame.left.scale
+    eng.set_emotion("happy")
+    assert eng.update(1 / 60).left.scale > before * 1.08
+    eng.set_emotion("happy")  # the same face again does not pop
+    for _ in range(60):
+        eng.update(1 / 60)
+    eng.set_emotion("happy")
+    assert eng.update(1 / 60).left.scale < before * 1.08
