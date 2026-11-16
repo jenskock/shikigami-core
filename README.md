@@ -143,6 +143,7 @@ Troubleshooting a silent mic:
 - Check the level bar: if it stays at 0 while you talk, grant **Microphone**
   permission to the terminal app, or set `sim.mic_device`.
 - If the bar moves but turns never start, lower `voice.vad_confidence`.
+- `heard:` is the transcript sent to the model. `user turn ended with no transcript` means Whisper returned nothing before `stt.timeout_s`; that turn is not sent, so the next utterance still works.
 
 ## Configuration
 

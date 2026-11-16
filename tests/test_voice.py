@@ -22,7 +22,13 @@ from shikigami.config import REPO_ROOT, LLMConfig, load_config
 from shikigami.memory.store import MemoryStore
 from shikigami.personality.loader import load_personality
 from shikigami.voice.mute import MicMute, MovingGateTurnStart, interruptions_enabled
-from shikigami.voice.pipeline import VoiceSession, _user_params
+from shikigami.voice.pipeline import (
+    CompatibleLLMService,
+    VoiceSession,
+    _user_params,
+    context_has_dialogue,
+    empty_dialogue_rejection,
+)
 from shikigami.voice.tools import build_tool_schemas
 from shikigami.voice.transport import FakeAudioTransport
 
@@ -148,6 +154,9 @@ def test_mic_pipeline_uses_silero_and_smart_turn():
     assert isinstance(stop, TurnAnalyzerUserTurnStopStrategy)
     assert isinstance(stop._turn_analyzer, LocalSmartTurnAnalyzerV3)
     assert stop._turn_analyzer._params.stop_secs == cfg.sim.vad_silence_s
+    assert params.empty_user_turn is None
+    assert params.user_turn_stop_timeout == cfg.stt.timeout_s
+    assert CompatibleLLMService.supports_developer_role is False
 
 
 def test_text_pipeline_does_not_load_smart_turn():
@@ -155,6 +164,27 @@ def test_text_pipeline_does_not_load_smart_turn():
     params = _user_params(cfg, audio_in=False, mute=MicMute(), moving=lambda: False)
     assert params.vad_analyzer is None
     assert isinstance(params.user_turn_strategies.stop[0], SpeechTimeoutUserTurnStopStrategy)
+    assert params.empty_user_turn is None
+
+
+def test_system_or_developer_only_context_is_not_sent():
+    system = {"role": "system", "content": "You are Kogane"}
+    developer = {
+        "role": "developer",
+        "content": "The user may have said something, but it was not recognized.",
+    }
+    assert not context_has_dialogue([system])
+    assert not context_has_dialogue([system, developer])
+    assert not context_has_dialogue([system, {"role": "user", "content": "   "}])
+    assert context_has_dialogue([system, {"role": "user", "content": "Hallo"}])
+    assert context_has_dialogue(
+        [system, {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]}]
+    )
+    rejection = Exception(
+        "Error code: 400 - messages must contain at least one non-system message with content"
+    )
+    assert empty_dialogue_rejection(rejection)
+    assert not empty_dialogue_rejection(Exception("Error code: 400 - unknown model"))
 
 
 class _BytesTTS(TTSService):

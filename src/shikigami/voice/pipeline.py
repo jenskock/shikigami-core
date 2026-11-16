@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 
 import aiohttp
 import httpx
-from openai import DefaultAsyncHttpxClient
+from openai import BadRequestError, DefaultAsyncHttpxClient
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -50,6 +50,7 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.utils.errors import ErrorCategory
 from pipecat.workers.runner import WorkerRunner
 
 from ..brain.actions import Action
@@ -69,6 +70,33 @@ _LANG_ALIASES = {
     "spanish": "es",
     "japanese": "ja",
 }
+
+
+_DIALOGUE_ROLES = frozenset({"user", "assistant", "tool"})
+
+
+def context_has_dialogue(messages: list) -> bool:
+    """True when the completion has a user, assistant, or tool message with content.
+
+    OpenAI-compatible servers (llama.cpp, vLLM, Ollama, some routers) reject a
+    request whose only messages are system or developer, and Pipecat then
+    marks the LLM service unusable for the rest of the process.
+    """
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in _DIALOGUE_ROLES:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return True
+        if message.get("tool_calls"):
+            return True
+    return False
+
+
+def empty_dialogue_rejection(exception: BaseException) -> bool:
+    """The 400 from a completion that had no user, assistant, or tool content."""
+    text = str(exception)
+    return "non-system message" in text and "content" in text
 
 
 def stt_language(name: str) -> Language:
@@ -102,6 +130,14 @@ class SituationProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, LLMContextFrame):
             self._session.prepare_context(frame.context)
+            if not context_has_dialogue(frame.context.messages):
+                roles = [
+                    message.get("role", "?")
+                    for message in frame.context.messages
+                    if isinstance(message, dict)
+                ]
+                self._session.drop_undialogued_turn(roles)
+                return
         await self.push_frame(frame, direction)
 
 
@@ -235,12 +271,33 @@ def _user_params(
         vad = None
         start = [TranscriptionUserTurnStartStrategy()]
         stop = [SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=cfg.sim.vad_silence_s)]
+    # No transcript: stay quiet. llama.cpp, vLLM, and Ollama treat a
+    # developer-role "please repeat" as a system message, reject the request,
+    # and that 400 takes the LLM offline. The stop timeout is the STT budget,
+    # so a slow Whisper reply still joins this turn.
     return LLMUserAggregatorParams(
         vad_analyzer=vad,
         user_mute_strategies=[ManualMuteStrategy(mute)],
         user_turn_strategies=UserTurnStrategies(start=start, stop=stop),
         user_idle_timeout=0,
+        user_turn_stop_timeout=cfg.stt.timeout_s,
+        empty_user_turn=None,
     )
+
+
+class CompatibleLLMService(OpenAILLMService):
+    """Chat completions for servers that are not OpenAI's own API.
+
+    ``developer`` is sent as ``user``. A rejection that means "this turn had
+    no spoken text" does not take the service offline.
+    """
+
+    supports_developer_role = False
+
+    def _classify_error(self, exception: Exception) -> ErrorCategory | None:
+        if isinstance(exception, BadRequestError) and empty_dialogue_rejection(exception):
+            return ErrorCategory.APPLICATION
+        return super()._classify_error(exception)
 
 
 class VoiceSession(ToolHooks):
@@ -361,6 +418,13 @@ class VoiceSession(ToolHooks):
                     self._input = text
                 break
 
+    def drop_undialogued_turn(self, roles: list[str]) -> None:
+        self._log.warning(
+            "not sending this turn to the model (no user text; roles=%s)",
+            ",".join(roles) or "none",
+        )
+        self.finish_turn()
+
     def mark_busy(self) -> None:
         self._tools = 0
         self._expect_speech = False
@@ -459,10 +523,10 @@ class VoiceSession(ToolHooks):
         transport, output_rate = self._open_transport(audio_out)
         self._transport = transport
         stt = self._build_stt() if self._audio_in else None
-        llm = OpenAILLMService(
+        llm = CompatibleLLMService(
             api_key=self._cfg.llm.api_key or "not-needed",
             base_url=self._cfg.llm.base_url,
-            settings=OpenAILLMService.Settings(
+            settings=CompatibleLLMService.Settings(
                 model=self._cfg.llm.model,
                 temperature=self._cfg.llm.temperature,
                 max_tokens=self._cfg.llm.max_tokens,
@@ -489,6 +553,14 @@ class VoiceSession(ToolHooks):
                 moving=self._moving,
             ),
         )
+
+        @pair.user().event_handler("on_user_turn_stopped")
+        async def _heard(_aggregator, _strategy, message) -> None:
+            text = (message.content or "").strip()
+            if text:
+                self._log.info("heard: %s", text)
+            else:
+                self._log.warning("user turn ended with no transcript")
 
         @pair.assistant().event_handler("on_assistant_turn_stopped")
         async def _on_assistant(_aggregator, message) -> None:
@@ -580,6 +652,7 @@ class VoiceSession(ToolHooks):
             api_key=self._cfg.stt.api_key or "not-needed",
             base_url=self._cfg.stt.base_url or None,
             http_client=_http_client(self._cfg.stt.timeout_s),
+            ttfs_p99_latency=self._cfg.stt.timeout_s,
             settings=OpenAISTTService.Settings(
                 model=self._cfg.stt.model,
                 language=stt_language(self._cfg.stt.language),
