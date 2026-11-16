@@ -26,8 +26,9 @@ tts:
   provider: "piper-http" # openai | piper-http | none. "piper" is refused (in-process GPL).
   base_url: "http://jesktop:5000" # `make setup-piper` — Mac local piper: http://127.0.0.1:5000
   api_key: ""
-  model: "openai/tts-1" # used only when provider=openai (Requesty). OpenAI TTS here is PCM.
-  voice: "alloy" # OpenAI voice. Piper uses the voice loaded by the HTTP server.
+  # provider=openai: Requesty model id. VoiceDesign wants a free-text description in voice.
+  model: "deepinfra/Qwen/Qwen3-TTS-VoiceDesign"
+  voice: "A clear young female German voice, soft cheerful and playful, natural pitch, easy to understand, warm and goofy like a small friendly spirit"
   piper_voice: "" # unused by the app; the setup script picks the server voice
   response_format: "wav" # piper-http returns WAV. openai TTS in Pipecat is PCM at 24 kHz.
   timeout_s: 30

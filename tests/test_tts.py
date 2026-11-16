@@ -125,3 +125,86 @@ def test_in_process_piper_is_refused():
     cfg.tts.enabled = True
     with pytest.raises(RuntimeError, match="GPL"):
         build_tts(cfg, session=None)
+
+
+def test_openai_tts_accepts_free_text_voice_design():
+    from shikigami.voice.openai_compat_tts import FreeTextVoiceOpenAITTSService
+
+    cfg = load_config()
+    cfg.tts.provider = "openai"
+    cfg.tts.enabled = True
+    cfg.tts.base_url = "https://router.eu.requesty.ai/v1"
+    cfg.tts.model = "deepinfra/Qwen/Qwen3-TTS-VoiceDesign"
+    cfg.tts.voice = "A clear young female German voice, soft cheerful and playful"
+    cfg.tts.api_key = "test-key"
+    service = build_tts(cfg, session=None)
+    assert isinstance(service, FreeTextVoiceOpenAITTSService)
+    assert service._settings.voice == cfg.tts.voice
+    assert service._settings.model == cfg.tts.model
+
+
+def test_openai_compat_tts_labels_pcm_as_24khz():
+    """Device output is often 48 kHz; mislabeling 24 kHz PCM as 48 kHz chipmunks."""
+    from pipecat.frames.frames import TTSAudioRawFrame
+    from pipecat.services.openai.tts import OPENAI_SAMPLE_RATE
+
+    from shikigami.voice.openai_compat_tts import FreeTextVoiceOpenAITTSService
+
+    class _Resp:
+        status_code = 200
+
+        async def text(self):
+            return ""
+
+        def iter_bytes(self, _size):
+            async def _gen():
+                yield b"\x00\x01" * 32
+
+            return _gen()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Stream:
+        def create(self, **_kwargs):
+            return _Resp()
+
+    class _Speech:
+        with_streaming_response = _Stream()
+
+    class _Audio:
+        speech = _Speech()
+
+    class _Client:
+        audio = _Audio()
+
+    service = FreeTextVoiceOpenAITTSService(
+        api_key="x",
+        settings=FreeTextVoiceOpenAITTSService.Settings(
+            model="deepinfra/Qwen/Qwen3-TTS-VoiceDesign",
+            voice="A clear young female German voice",
+        ),
+    )
+    service._client = _Client()
+    service._sample_rate = 48000  # what a Mac speaker transport would set
+
+    async def _usage(_text):
+        return None
+
+    async def _ttfb():
+        return None
+
+    service.start_tts_usage_metrics = _usage  # type: ignore[method-assign]
+    service.stop_ttfb_metrics = _ttfb  # type: ignore[method-assign]
+
+    frames = asyncio.run(_collect_openai(service))
+    audio = [f for f in frames if isinstance(f, TTSAudioRawFrame)]
+    assert audio
+    assert all(f.sample_rate == OPENAI_SAMPLE_RATE == 24000 for f in audio)
+
+
+async def _collect_openai(service):
+    return [frame async for frame in service.run_tts("hallo", "ctx")]

@@ -40,7 +40,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.stt import OpenAISTTService
-from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport
@@ -63,6 +62,7 @@ from ..config import Config
 from ..memory.store import MemoryStore
 from .barge_in import MotionAwareVADUserTurnStartStrategy
 from .mute import ManualMuteStrategy, MicMute
+from .openai_compat_tts import FreeTextVoiceOpenAITTSService
 from .piper_http import PiperHttpTTSService
 from .tools import ToolHooks, build_tool_schemas
 from .transport import FakeAudioTransport, SounddeviceTransport
@@ -264,11 +264,15 @@ def build_tts(
                 timeout_s=cfg.tts.timeout_s,
             )
         case "openai":
-            return OpenAITTSService(
+            # Free-text voice: stock OpenAI ids, or VoiceDesign descriptions via Requesty.
+            return FreeTextVoiceOpenAITTSService(
                 api_key=cfg.tts.api_key or "not-needed",
                 base_url=cfg.tts.base_url or None,
                 http_client=_http_client(cfg.tts.timeout_s),
-                settings=OpenAITTSService.Settings(model=cfg.tts.model, voice=cfg.tts.voice),
+                settings=FreeTextVoiceOpenAITTSService.Settings(
+                    model=cfg.tts.model,
+                    voice=cfg.tts.voice,
+                ),
             )
         case _:
             raise RuntimeError(f"unknown tts.provider {provider!r}")

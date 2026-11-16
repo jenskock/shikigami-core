@@ -60,5 +60,5 @@ def test_personality_loads():
     p = load_personality(REPO_ROOT / "config" / "personality.yaml")
     assert p.name == "Kogane"
     assert p.character
-    assert p.language == "German"  # matches the de_DE piper voice
+    assert p.language == "German"  # keep in sync with the TTS voice
     assert len(p.rules) >= 3
