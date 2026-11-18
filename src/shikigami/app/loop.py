@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from typing import Any, assert_never
 
 from ..brain.actions import (
@@ -18,11 +19,15 @@ from ..brain.actions import (
     format_tool_call,
 )
 from ..brain.agent import Brain
-from ..config import Config
+from ..config import REPO_ROOT, Config
 from ..hal.interfaces import HAL
 from ..hal.sim.state import SimState
 from ..memory.store import MemoryStore
-from ..perception.tracker import FaceTracker
+from ..perception import FaceTracker, Perception, build_detector
+from ..perception.look import Looker, persona_from
+from ..perception.people import PeopleSettings, PeopleTracker
+from ..perception.pipeline import describe_view
+from ..perception.recognition import MAX_PER_NAME, FaceGallery, build_recognizer
 from ..reflexes.loop import ReflexLoop
 from ..voice.pipeline import VoiceSession
 from .bus import EventBus
@@ -78,6 +83,10 @@ class App:
         self._ui_state: SimState | None = getattr(hal, "state", None)
         self._dashboard = getattr(hal, "dashboard", None)
         self._reflex: ReflexLoop | None = None
+        self.perception: Perception | None = None
+        self.faces = FaceGallery()
+        self.looker: Looker | None = None
+        self._vision_tools: tuple[str, ...] = ()  # offered to the voice LLM
         self._reflex_task: asyncio.Task | None = None
         self._turn_lock = asyncio.Lock()  # serialize stdin / dashboard turns
         self._body_lock = asyncio.Lock()  # one body motion at a time: moves and gestures
@@ -94,6 +103,8 @@ class App:
             dash.on_submit = lambda line: asyncio.create_task(self._submit_text(line))
             dash.on_close = self.request_stop  # quit button / window X
             dash.on_mute_toggle = self.toggle_mic_mute
+        if self.cfg.perception.track_faces or self.cfg.sim.camera_preview:
+            self._start_perception()
         if self._use_voice and self.brain is not None:
             self.voice = VoiceSession(
                 self.cfg,
@@ -108,21 +119,29 @@ class App:
                 note_tool_line=self._note_tool,
                 on_ui=self._set_sim_state,
                 on_heard=self._on_voice_heard,
+                vision_tool=self.vision_tool if self._vision_tools else None,
+                vision_tools=self._vision_tools,
                 log=logging.getLogger("shikigami.voice"),
             )
             await self.voice.start()
             if self.voice.listening:
                 self._set_sim_state(status="idle", mic="idle")
         tracker = None
-        if self.cfg.perception.track_faces:
+        if self.cfg.perception.track_faces and self.perception is not None:
             tracker = FaceTracker(
-                self.hal.camera,
+                self.perception,
                 self.hal.motion,
                 self.hal.expression,
                 self.bus.publish,
                 self.cfg.perception,
             )
-        self._reflex = ReflexLoop(self.hal, self.bus, self.cfg.reflexes, tracker=tracker)
+        self._reflex = ReflexLoop(
+            self.hal,
+            self.bus,
+            self.cfg.reflexes,
+            tracker=tracker,
+            perception=self.perception,
+        )
         self._reflex_task = asyncio.create_task(self._reflex.run())
         listening = self.voice.listening if self.voice is not None else False
         self.log.info(
@@ -133,6 +152,85 @@ class App:
         )
         if self.brain is not None:
             await self.brain.warmup()
+
+    def _start_perception(self) -> None:
+        """Detector + people (tracks, recognition) on the camera. Same on Mac and Pi."""
+        pcfg = self.cfg.perception
+        plog = logging.getLogger("shikigami.perception")
+        self.faces = FaceGallery.from_rows(self.memory.faces())
+        recognizer = build_recognizer(pcfg, REPO_ROOT, plog)
+        if recognizer is not None:
+            plog.info("face recognition: sface, known: %s", ", ".join(self.faces.names()) or "-")
+        self.perception = Perception(
+            self.hal.camera,
+            build_detector(pcfg, REPO_ROOT, plog),
+            detect_hz=pcfg.detect_hz,
+            log=plog,
+            people=PeopleTracker(recognizer, self.faces, PeopleSettings.from_config(pcfg)),
+        )
+        self.perception.start()
+        tools: list[str] = []
+        if pcfg.look and not self.cfg.llm.mock:
+            self.looker = Looker(
+                self.hal.camera,
+                self.cfg.llm,
+                pcfg,
+                self.cfg.camera,
+                view=lambda: self._state_dict()["in_view"],
+                persona=persona_from(getattr(self.brain, "_personality", None)),
+                save_to=REPO_ROOT / "data" / "last-look.jpg",
+                log=logging.getLogger("shikigami.look"),
+            )
+            tools.append("look")
+        if recognizer is not None:
+            tools += ["remember_face", "forget_face"]
+        self._vision_tools = tuple(tools)
+
+    async def vision_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """look / remember_face / forget_face from the voice LLM. Returns what happened."""
+        if name == "look":
+            if self.looker is None:
+                return {"ok": False, "error": "looking is not available"}
+            question = str(args.get("question") or "")
+            self.log.info("tool look(question=%r)", question)
+            await self.hal.expression.emote("curious")
+            result = await self.looker.look(question)
+            await self.bus.publish("looked", {"saw": result.get("saw", result.get("error"))})
+            if result.get("ok"):
+                # The answer is already in the robot's voice: speak it, no 2nd completion.
+                return {**result, "say": result["saw"], "run_llm": False}
+            return {**result, "run_llm": True}  # let the LLM say it can't see
+        person = str(args.get("name") or "").strip()
+        if not person:
+            return {"ok": False, "error": "no name given"}
+        if self.perception is None:
+            return {"ok": False, "error": "camera is off"}
+        if name == "remember_face":
+            self.log.info("tool remember_face(name=%r) — look at the camera", person)
+            await self.hal.expression.emote("focused")
+            req = await self.perception.enroll(self.cfg.perception.enroll_samples)
+            if not req.ok:
+                self.log.info("remember_face %r failed: %s", person, req.reason)
+                return {"ok": False, "error": req.reason or "no clear face"}
+            for emb in req.embeddings:
+                self.memory.add_face(person, emb.astype("float32").tobytes())
+            self.memory.prune_faces(person, MAX_PER_NAME)
+            self.faces.add(person, req.embeddings)
+            if req.track_id is not None:
+                self.perception.name_track(req.track_id, person)
+            await self.bus.publish("face_learned", {"name": person})
+            self.log.info("learned face of %s (%d samples)", person, len(req.embeddings))
+            return {"ok": True, "name": person}
+        if name == "forget_face":
+            removed = self.memory.forget_face(person)
+            self.faces.forget(person)
+            self.perception.forget(person)
+            if not removed:
+                return {"ok": False, "error": f"no face stored for {person}"}
+            await self.bus.publish("face_forgotten", {"name": person})
+            self.log.info("forgot face of %s", person)
+            return {"ok": True, "name": person}
+        return {"ok": False, "error": f"unknown tool {name}"}
 
     def request_stop(self) -> None:
         """Ask the input loops to exit (dashboard quit button, window X, q key)."""
@@ -175,6 +273,8 @@ class App:
             self._reflex_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reflex_task
+        if self.perception is not None:
+            await asyncio.to_thread(self.perception.stop)
         await self.hal.stop()
         self.memory.close()
 
@@ -186,6 +286,13 @@ class App:
         }
         if self._ui_state is not None:
             state["last_motion"] = self._ui_state.last_motion
+        # The only vision fact the LLM gets; the prompt forbids claiming more.
+        perception = self.perception
+        state["in_view"] = describe_view(
+            perception.latest() if perception is not None else None,
+            time.monotonic(),
+            camera_on=perception is not None,
+        )
         return state
 
     def _set_sim_state(self, **kw: Any) -> None:

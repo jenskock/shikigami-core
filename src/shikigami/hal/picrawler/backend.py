@@ -12,10 +12,10 @@ from typing import Any
 
 from shikigami.expression.eyes.state import EyesConfig
 
+from ..cameras import make_camera
 from ..errors import BackendUnavailable
 from ..interfaces import HAL, Camera, Expression, Motion, SensorReading, Sensors
 from ..sim.audio import SimAudio
-from ..sim.camera import SimCamera
 from ..sim.dashboard import SimDashboard
 from ..sim.expression import SimExpression
 from ..sim.sensors import SimSensors
@@ -84,30 +84,6 @@ class PicrawlerSensors(Sensors):
         raise NotImplementedError("map SensorReading to picrawler ultrasonic/IMU")
 
 
-class PicrawlerCamera(Camera):
-    def __init__(self, inner: Camera | None = None) -> None:
-        self._inner = inner
-
-    async def start(self) -> None:
-        if self._inner is not None:
-            await self._inner.start()
-            return
-        raise NotImplementedError("use vilib camera on the Pi")
-
-    async def read_frame(self) -> Any | None:
-        if self._inner is not None:
-            return await self._inner.read_frame()
-        raise NotImplementedError("use vilib camera on the Pi")
-
-    async def preview_frame(self) -> None:
-        if self._inner is not None:
-            await self._inner.preview_frame()
-
-    async def stop(self) -> None:
-        if self._inner is not None:
-            await self._inner.stop()
-
-
 class PicrawlerHAL(HAL):
     """Real Picrawler on Pi; SoftPicrawler + sim chrome when libs are missing."""
 
@@ -124,12 +100,7 @@ class PicrawlerHAL(HAL):
             dashboard = SimDashboard(enabled=cfg.sim.window or cfg.sim.camera_preview, log=log)
             dashboard.state = self.state
             self.dashboard = dashboard
-            camera: Camera = SimCamera(
-                cfg.sim.camera_index,
-                preview=cfg.sim.camera_preview,
-                dashboard=dashboard,
-                log=log,
-            )
+            camera: Camera = make_camera(cfg, on_robot=False, dashboard=dashboard, log=log)
             audio = SimAudio.from_sim_config(
                 cfg.sim,
                 log=log,
@@ -171,7 +142,7 @@ class PicrawlerHAL(HAL):
         super().__init__(
             backend="picrawler",
             motion=motion,
-            camera=PicrawlerCamera(),
+            camera=make_camera(cfg, on_robot=True, log=log),
             audio=SimAudio.from_sim_config(cfg.sim, log=log),
             sensors=PicrawlerSensors(),
             expression=PicrawlerExpression(log),

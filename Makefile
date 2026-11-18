@@ -1,4 +1,4 @@
-.PHONY: sync run-sim test lint fmt deploy setup-piper setup-whisper
+.PHONY: sync run-sim test lint fmt deploy setup-piper setup-whisper setup-vision enroll-face
 
 UV ?= uv
 
@@ -27,3 +27,8 @@ setup-piper: ## install piper-tts + German voice, start the TTS server (on jeskt
 setup-whisper: ## install faster-whisper-server, start OpenAI-compatible STT on :8000 (on jesktop)
 	bash scripts/setup-whisper.sh
 
+setup-vision: ## download vision models (YuNet faces, SFace recognition) into data/models
+	bash scripts/setup-vision.sh
+
+enroll-face: ## learn a face: make enroll-face NAME=Anna (or ARGS=--list / ARGS="--delete Anna")
+	$(UV) run python scripts/enroll_face.py $(if $(NAME),--name "$(NAME)") $(ARGS)

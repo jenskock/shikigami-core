@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Protocol
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from pipecat.adapters.llm.schemas.direct_function import tool_options
 from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
@@ -20,6 +21,47 @@ from pipecat.services.llm_service import FunctionCallParams
 from ..brain.actions import TOOL_SCHEMAS, Action, parse_tool_call
 
 STOP_TOOL_NAME = "stop_running_tools"
+
+# Vision tools return data, unlike body tools. look always runs the LLM again so it
+# can retell what it saw; remember/forget_face only on failure, so the robot can say
+# honestly what went wrong ("Ich seh grad kein Gesicht").
+VisionTool = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+VISION_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "look",
+        "description": (
+            "Take a picture with your camera and get a short description of what is "
+            "really there. Call it whenever you are asked what you see, how someone "
+            "looks, what they hold or wear, or what is in the room. Say something tiny "
+            'first ("Ich schau mal!"), then retell only what the result says. '
+            "Takes one or two seconds."
+        ),
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "What to look for, e.g. 'what is Jens holding?'. Optional.",
+            }
+        },
+        "required": [],
+    },
+    {
+        "name": "remember_face",
+        "description": (
+            "Learn the face currently in view under a name, so you recognize this person "
+            'later. Call it when someone tells you their name ("Ich bin Anna", "Merk dir '
+            'mein Gesicht") while state.in_view shows exactly one face that is unknown. '
+            "Takes about two seconds; the person should look at you."
+        ),
+        "properties": {"name": {"type": "string", "description": "The person's name, e.g. Anna."}},
+        "required": ["name"],
+    },
+    {
+        "name": "forget_face",
+        "description": "Forget a learned face when someone asks you to forget it.",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    },
+]
 
 _log = logging.getLogger("shikigami.voice.tools")
 
@@ -119,6 +161,21 @@ def build_tool_schemas(hooks: ToolHooks) -> list[FunctionSchema]:
             handler=stop_handler,
         )
     ]
+    vision_tool: VisionTool | None = getattr(hooks, "vision_tool", None)
+    offered: set[str] = set(getattr(hooks, "vision_tools", ()) or ())
+    if vision_tool is not None:
+        for spec in VISION_TOOL_SCHEMAS:
+            if offered and spec["name"] not in offered:
+                continue
+            schemas.append(
+                FunctionSchema(
+                    name=spec["name"],
+                    description=spec["description"],
+                    properties=spec["properties"],
+                    required=spec["required"],
+                    handler=_vision_handler(vision_tool),
+                )
+            )
     for spec in TOOL_SCHEMAS:
         fn = spec["function"]
         params = fn["parameters"]
@@ -132,3 +189,25 @@ def build_tool_schemas(hooks: ToolHooks) -> list[FunctionSchema]:
             )
         )
     return schemas
+
+
+def _vision_handler(vision_tool: VisionTool):
+    @tool_options(cancel_on_interruption=False)
+    async def handler(params: FunctionCallParams) -> None:
+        try:
+            result = await vision_tool(params.function_name, dict(params.arguments))
+        except Exception as exc:
+            _log.warning("tool %s failed: %s", params.function_name, exc)
+            result = {"ok": False, "error": str(exc)}
+        # "say": the tool already has the spoken answer (look) — speak it here instead
+        # of a second completion, which often answered with only an emote. Otherwise
+        # the reply was already spoken on success; on failure the LLM says what failed.
+        say = str(result.pop("say", "") or "").strip()
+        if say:
+            await params.llm.push_frame(speak_frame(say))
+        run_llm = bool(result.pop("run_llm", not result.get("ok", False)))
+        await params.result_callback(
+            result, properties=FunctionCallResultProperties(run_llm=run_llm)
+        )
+
+    return handler

@@ -1,4 +1,4 @@
-"""Small persistent store (SQLite via stdlib): user facts, recent events, mood."""
+"""Small persistent store (SQLite via stdlib): user facts, recent events, mood, face embeddings."""
 
 from __future__ import annotations
 
@@ -44,6 +44,13 @@ class MemoryStore:
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS faces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS faces_name ON faces(name);
             CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -97,3 +104,37 @@ class MemoryStore:
     def get_mood(self, default: str = "neutral") -> str:
         row = self._db.execute("SELECT value FROM kv WHERE key='mood'").fetchone()
         return row["value"] if row else default
+
+    # -- faces (recognition embeddings; float32 vectors) -----------------------------
+
+    def add_face(self, name: str, embedding: bytes) -> None:
+        self._db.execute(
+            "INSERT INTO faces(name, embedding, created_at) VALUES(?,?,?)",
+            (name, embedding, time.time()),
+        )
+        self._db.commit()
+
+    def faces(self) -> list[tuple[str, bytes]]:
+        rows = self._db.execute("SELECT name, embedding FROM faces ORDER BY id").fetchall()
+        return [(r["name"], bytes(r["embedding"])) for r in rows]
+
+    def face_names(self) -> list[str]:
+        rows = self._db.execute(
+            "SELECT name, COUNT(*) AS n FROM faces GROUP BY name ORDER BY name"
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+    def forget_face(self, name: str) -> int:
+        """Delete all embeddings for ``name`` (case-insensitive). Returns rows removed."""
+        cur = self._db.execute("DELETE FROM faces WHERE lower(name)=lower(?)", (name,))
+        self._db.commit()
+        return cur.rowcount
+
+    def prune_faces(self, name: str, keep: int) -> None:
+        """Keep only the newest ``keep`` embeddings for ``name``."""
+        self._db.execute(
+            "DELETE FROM faces WHERE name=? AND id NOT IN "
+            "(SELECT id FROM faces WHERE name=? ORDER BY id DESC LIMIT ?)",
+            (name, name, keep),
+        )
+        self._db.commit()

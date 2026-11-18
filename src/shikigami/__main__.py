@@ -26,6 +26,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mock", action="store_true", help="use the canned mock LLM (no network)")
     p.add_argument("--no-window", action="store_true", help="disable the sim face window")
     p.add_argument("--no-camera", action="store_true", help="disable the camera preview window")
+    p.add_argument(
+        "--camera-file", default=None, help="replay a video/image folder instead of the camera"
+    )
     p.add_argument("--no-tts", action="store_true", help="disable speech output")
     p.add_argument("--no-stt", action="store_true", help="text input (disable mic/STT)")
     p.add_argument("--mic", action="store_true", help="force mic input + STT (default for `sim`)")
@@ -69,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_camera:
         cfg.sim.camera_preview = False
         cfg.perception.track_faces = False
+    if args.camera_file:
+        cfg.camera.backend = "file"
+        cfg.camera.file = args.camera_file
     if args.no_tts:
         cfg.tts.enabled = False
     if args.mic:

@@ -1,69 +1,71 @@
-"""Face tracking: reuse camera preview detections when available, else detect once."""
+"""Face tracking: newest perception result -> look_at + face_seen / face_lost events."""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 
 from ..config import PerceptionConfig
-from ..hal.interfaces import Camera, Expression, Motion
+from ..hal.interfaces import Expression, Motion
+from .pipeline import STALE_S, PerceptionResult
+
+__all__ = ["STALE_S", "FaceTracker"]  # STALE_S: no fresh result this long = "no face"
 
 
 class Publisher(Protocol):
     async def publish(self, topic: str, payload: dict | None = None) -> Any: ...
 
 
-@runtime_checkable
-class _DetectingCamera(Protocol):
-    last_frame: Any | None
-    last_detections: list
+class ResultSource(Protocol):
+    def latest(self) -> PerceptionResult | None: ...
 
 
 class FaceTracker:
     def __init__(
         self,
-        camera: Camera,
+        perception: ResultSource,
         motion: Motion,
         expression: Expression,
         publish: Publisher,
         cfg: PerceptionConfig,
-        detector: Any | None = None,
         log: logging.Logger | None = None,
     ) -> None:
-        self._camera = camera
+        self.perception = perception
         self._motion = motion
         self._expression = expression
         self._publish = publish
         self._cfg = cfg
-        self._detector = detector
         self._log = log or logging.getLogger("shikigami.tracker")
         self._last_act = 0.0
+        self._last_seq = -1
         self._face_present = False
 
     async def poll(self) -> None:
+        drain = getattr(self.perception, "drain_events", None)
+        if drain is not None:  # person_arrived / person_left from the perception thread
+            for topic, payload in drain():
+                self._log.info("%s %s", topic, payload)
+                await self._publish(topic, payload)
         if not self._cfg.track_faces:
             return
-        preview = self._camera if isinstance(self._camera, _DetectingCamera) else None
-        frame = preview.last_frame if preview is not None else None
-        if frame is None:
-            frame = await self._camera.read_frame()
-        boxes = list(preview.last_detections) if preview is not None else []
-        faces = [b for b in boxes if b[0] == "face"]
-        if not faces and frame is not None and self._detector is not None:
-            faces = [d for d in self._detector.detect_all(frame) if d[0] == "face"]
+        res = self.perception.latest()
+        now = time.monotonic()
+        stale = res is None or now - res.t > STALE_S
+        if not stale and res.seq == self._last_seq:
+            return  # nothing new since the last tick
+        faces = [] if stale else res.of("face")
+        if res is not None:
+            self._last_seq = res.seq
         if not faces:
             if self._face_present:
                 self._face_present = False
                 await self._publish("face_lost", {})
             return
-        now = time.monotonic()
-        _, x, y, w, h = max(faces, key=lambda d: d[3] * d[4])
-        if frame is None:
-            return
-        fh, fw = frame.shape[:2]
-        cx = (x + w / 2) / fw * 2 - 1
-        cy = -((y + h / 2) / fh * 2 - 1)
+        face = max(faces, key=lambda d: d.area)
+        fx, fy = face.center
+        cx = fx * 2 - 1
+        cy = -(fy * 2 - 1)
         await self._motion.look_at(cx, cy)
         if now - self._last_act < self._cfg.face_cooldown_s:
             return

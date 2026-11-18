@@ -58,15 +58,38 @@ class Motion(abc.ABC):
     async def play_action(self, name: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class Frame:
+    """One camera frame in both streams. Same shapes on Pi and Mac (see CameraConfig).
+
+    ``main`` and ``lores`` are BGR uint8 ndarrays: ``main`` is the full frame for
+    snapshots, ``lores`` the small frame detectors run on. ``seq`` increases by one
+    per delivered frame; ``t`` is ``time.monotonic()`` at capture.
+    """
+
+    main: Any
+    lores: Any
+    seq: int
+    t: float
+
+
 class Camera(abc.ABC):
     @abc.abstractmethod
     async def start(self) -> None: ...
 
     @abc.abstractmethod
-    async def read_frame(self) -> Any | None: ...  # backend-specific frame (e.g. ndarray)
+    async def read_frame(self) -> Any | None: ...  # latest main frame (BGR ndarray)
 
-    async def preview_frame(self) -> None:
-        """Show the latest frame in a preview window, annotated if supported. No-op default."""
+    def latest(self) -> Frame | None:
+        """Newest frame without blocking, or None. Cameras without streams return None."""
+        return None
+
+    async def snapshot_jpeg(self, max_side: int = 768, quality: int = 80) -> bytes | None:
+        """JPEG of the newest main frame, longest side <= max_side. None without a frame."""
+        return None
+
+    async def preview_frame(self, detections: list | None = None) -> None:
+        """Show the latest frame with detection boxes, if there is a preview. No-op default."""
         return None
 
     @abc.abstractmethod

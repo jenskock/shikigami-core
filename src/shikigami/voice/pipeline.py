@@ -410,6 +410,8 @@ class VoiceSession(ToolHooks):
         note_tool_line: Callable[[Action], None],
         on_ui: Callable[..., None] | None = None,
         on_heard: Callable[[str], Awaitable[None]] | None = None,
+        vision_tool: Callable[[str, dict], Awaitable[dict]] | None = None,
+        vision_tools: tuple[str, ...] = (),
         log: logging.Logger | None = None,
         transport: BaseTransport | None = None,
         tts_service: TTSService | None = None,
@@ -426,6 +428,8 @@ class VoiceSession(ToolHooks):
         self._note_tool_line = note_tool_line
         self._on_ui = on_ui
         self._on_heard = on_heard
+        self.vision_tool = vision_tool  # look / remember_face / forget_face; None = none
+        self.vision_tools = vision_tools  # which of them to offer (empty = all)
         self._log = log or logging.getLogger("shikigami.voice")
         self._transport_override = transport
         self._tts_override = tts_service

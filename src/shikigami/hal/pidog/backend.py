@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ..cameras import make_camera
 from ..errors import BackendUnavailable
-from ..interfaces import HAL, Camera, Expression, Motion, SensorReading, Sensors
+from ..interfaces import HAL, Expression, Motion, SensorReading, Sensors
 from ..sim.audio import SimAudio  # placeholder until a Pi audio HAT is wired
 
 try:  # guarded: only importable on a Pi with SunFounder libs installed
@@ -114,16 +115,6 @@ class PiDogSensors(Sensors):
         raise NotImplementedError("map SensorReading to pidog ultrasonic/touch/IMU")
 
 
-class PiDogCamera(Camera):
-    async def start(self) -> None:
-        raise NotImplementedError("use vilib camera on the Pi")
-
-    async def read_frame(self) -> Any | None:
-        raise NotImplementedError("use vilib camera on the Pi")
-
-    async def stop(self) -> None: ...
-
-
 class PiDogHAL(HAL):
     def __init__(self, cfg) -> None:
         if not _HAS_PIDOG:
@@ -133,7 +124,7 @@ class PiDogHAL(HAL):
         super().__init__(
             backend="pidog",
             motion=PiDogMotion(dog, log),
-            camera=PiDogCamera(),
+            camera=make_camera(cfg, on_robot=True, log=log),
             audio=SimAudio.from_sim_config(cfg.sim, log=log),  # Pi audio HAT not wired yet
             sensors=PiDogSensors(dog),
             expression=PiDogExpression(dog, log),

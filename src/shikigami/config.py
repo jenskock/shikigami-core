@@ -80,9 +80,38 @@ class SimConfig(BaseModel):
     input: str = "mic"  # text | mic
 
 
+class CameraConfig(BaseModel):
+    """Camera frames. Same contract on Pi (picamera2) and Mac (webcam/file emulation)."""
+
+    backend: str = "auto"  # auto | picamera2 | webcam | file
+    file: str = ""  # backend=file: video file or folder of images, played in a loop
+    fps: float = 15.0  # frames delivered per second (Pi rate; the Mac is capped to it)
+    main_size: tuple[int, int] = (1280, 960)  # full frame for snapshots (4:3 like the Pi sensor)
+    detect_size: tuple[int, int] = (320, 240)  # low-res stream the detectors run on
+    pi_profile: bool = True  # webcam/file: emulate Pi stream sizes + rate (off = native, uncapped)
+    flip: str = "none"  # none | h | v | both — camera mounting
+    snapshot_max_side: int = 768  # JPEG snapshot size for the LLM
+
+
 class PerceptionConfig(BaseModel):
     track_faces: bool = True  # look at detected faces via the camera
     face_cooldown_s: float = 2.0  # min time between look_at/emote reactions to faces
+    detect_hz: float = 10.0  # detector rate on the low-res stream (same on Mac and Pi)
+    face_detector: str = "yunet"  # yunet | haar (yunet falls back to haar if the model is missing)
+    face_score: float = 0.7  # YuNet confidence threshold
+    cats: bool = True  # also detect cat faces (Haar until object detection lands)
+    models_dir: str = "data/models"  # `make setup-vision` downloads ONNX models here
+    recognize: bool = True  # SFace face recognition (needs face_detector: yunet + the model)
+    match_threshold: float = 0.40  # SFace cosine; higher = stricter (OpenCV suggests 0.363)
+    recheck_unknown_s: float = 1.5  # re-try recognizing an unknown face this often
+    recheck_known_s: float = 10.0  # re-confirm a known face this often
+    arrive_after_s: float = 0.6  # a face must be visible this long before person_arrived
+    leave_after_s: float = 10.0  # not seen this long -> person_left (turning away is fine)
+    enroll_samples: int = 5  # embeddings stored per remember_face
+    look: bool = True  # offer the look tool (snapshot -> cloud vision model)
+    vision_model: str = ""  # model for look; empty = llm.model (must accept images)
+    look_timeout_s: float = 12.0
+    look_max_tokens: int = 1536  # hidden reasoning counts too; 400 cut answers off
 
 
 class ReflexConfig(BaseModel):
@@ -129,6 +158,7 @@ class Config(BaseModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     sim: SimConfig = Field(default_factory=SimConfig)
+    camera: CameraConfig = Field(default_factory=CameraConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
     reflexes: ReflexConfig = Field(default_factory=ReflexConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
@@ -166,6 +196,11 @@ def load_config(path: str | Path | None = None) -> Config:
         cfg.backend = v
     if v := _env("SHIKIGAMI_LOG_LEVEL"):
         cfg.log_level = v
+    if v := _env("SHIKIGAMI_CAMERA"):
+        cfg.camera.backend = v
+    if v := _env("SHIKIGAMI_CAMERA_FILE"):
+        cfg.camera.file = v
+        cfg.camera.backend = "file"
 
     if v := _env("SHIKIGAMI_API_KEY", "OPENAI_API_KEY"):
         cfg.llm.api_key = v

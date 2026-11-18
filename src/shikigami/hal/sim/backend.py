@@ -6,9 +6,9 @@ import logging
 
 from shikigami.expression.eyes.state import EyesConfig
 
+from ..cameras import make_camera
 from ..interfaces import HAL
 from .audio import SimAudio
-from .camera import SimCamera
 from .dashboard import SimDashboard
 from .expression import SimExpression
 from .motion import SimMotion
@@ -30,12 +30,7 @@ class SimHAL(HAL):
         super().__init__(
             backend="sim",
             motion=SimMotion(self.state, log),
-            camera=SimCamera(
-                cfg.sim.camera_index,
-                preview=cfg.sim.camera_preview,
-                dashboard=dashboard,
-                log=log,
-            ),
+            camera=make_camera(cfg, on_robot=False, dashboard=dashboard, log=log),
             audio=SimAudio.from_sim_config(
                 cfg.sim,
                 log=log,

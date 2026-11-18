@@ -9,6 +9,7 @@ import time
 from ..app.bus import EventBus
 from ..config import ReflexConfig
 from ..hal.interfaces import HAL
+from ..perception.pipeline import Perception
 from ..perception.tracker import FaceTracker
 
 REACT_COOLDOWN_S = 2.0  # min time between touch/sound reactions, keeps the log readable
@@ -21,12 +22,14 @@ class ReflexLoop:
         bus: EventBus,
         cfg: ReflexConfig,
         tracker: FaceTracker | None = None,
+        perception: Perception | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self._hal = hal
         self._bus = bus
         self._cfg = cfg
         self._tracker = tracker
+        self._perception = perception
         self._log = log or logging.getLogger("shikigami.reflex")
         self._running = False
         self._last_touch = 0.0
@@ -74,7 +77,8 @@ class ReflexLoop:
                 await self._hal.expression.update(dt)
                 if dash is not None:
                     dash.pump()
-                await self._hal.camera.preview_frame()
+                res = self._perception.latest() if self._perception is not None else None
+                await self._hal.camera.preview_frame(res.preview_detections() if res else None)
                 if self._tracker is not None:
                     await self._tracker.poll()
                 if dash is not None:

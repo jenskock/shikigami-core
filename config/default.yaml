@@ -28,7 +28,7 @@ tts:
   api_key: ""
   # provider=openai: Requesty model id. VoiceDesign wants a free-text description in voice.
   model: "deepinfra/Qwen/Qwen3-TTS-VoiceDesign"
-  voice: "A clear young female German voice, soft cheerful and playful, natural pitch, easy to understand, warm and goofy like a small friendly spirit"
+  voice: "A calm adult German voice, medium-low pitch, even and slightly monotone, precise crisp articulation, measured steady pace, neutral and synthetic-sounding, like a friendly machine assistant"
   piper_voice: "" # unused by the app; the setup script picks the server voice
   response_format: "wav" # piper-http returns WAV. openai TTS in Pipecat is PCM at 24 kHz.
   timeout_s: 30
@@ -65,9 +65,37 @@ sim:
   sample_rate: 16000 # WAV/STT rate; capture uses the device's native rate (often 48 kHz)
   input: "mic" # text | mic
 
+# Camera frames: identical contract on the Pi (picamera2) and the Mac (webcam / file),
+# so the Mac behaves like the robot. See docs/camera-plan.md.
+camera:
+  backend: auto # auto (Pi: picamera2, Mac: webcam) | picamera2 | webcam | file
+  file: "" # backend=file: video or image folder, looped (or SHIKIGAMI_CAMERA_FILE / --camera-file)
+  fps: 15 # Pi camera rate; the Mac webcam is capped to it
+  main_size: [1280, 960] # full frame (4:3 like the Pi sensor) for snapshots
+  detect_size: [320, 240] # low-res stream the detectors see
+  pi_profile: true # webcam/file: crop+resize to the Pi streams and cap fps (false = native)
+  flip: none # none | h | v | both
+  snapshot_max_side: 768
+
 perception:
   track_faces: true # camera: look at detected faces, publish face_seen/face_lost
   face_cooldown_s: 2.0
+  detect_hz: 10 # detector rate, same on Mac and Pi
+  face_detector: yunet # yunet | haar — yunet needs `make setup-vision`, else falls back to haar
+  face_score: 0.7
+  cats: true # Haar cat faces for now
+  models_dir: "data/models"
+  recognize: true # SFace face recognition — needs yunet + `make setup-vision`
+  match_threshold: 0.40 # SFace cosine similarity; raise if strangers get named
+  recheck_unknown_s: 1.5
+  recheck_known_s: 10
+  arrive_after_s: 0.6 # visible this long -> person_arrived
+  leave_after_s: 10 # unseen this long -> person_left
+  enroll_samples: 5 # embeddings per remember_face / enroll script
+  look: true # look tool: snapshot -> cloud vision model -> description
+  vision_model: "" # empty = llm.model (Claude via Requesty takes images)
+  look_timeout_s: 12
+  look_max_tokens: 1536 # hidden reasoning counts too; 400 cut answers off
 
 reflexes:
   hz: 20 # fast local loop, no network
