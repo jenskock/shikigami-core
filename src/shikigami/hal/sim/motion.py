@@ -37,7 +37,11 @@ class SimMotion(Motion):
         await self._run(f"walk {direction} speed={speed:.2f}", duration_s)
 
     async def turn(
-        self, direction: str = "left", angle_deg: float | None = None, speed: float = 0.5
+        self,
+        direction: str = "left",
+        angle_deg: float | None = None,
+        speed: float = 0.5,
+        duration_s: float | None = None,
     ) -> None:
         angle = f" {angle_deg:.0f}deg" if angle_deg is not None else ""
         await self._run(f"turn {direction}{angle} speed={speed:.2f}", 1.0)

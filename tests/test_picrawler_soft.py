@@ -83,45 +83,45 @@ def test_picrawler_motion_publishes_servos():
     asyncio.run(_run())
 
 
-def test_playback_speed_shortens_keyframe_transition(monkeypatch):
+def test_realtime_keyframe_takes_as_long_as_on_the_robot(monkeypatch):
     sleeps: list[float] = []
-
-    def _sleep(dt: float) -> None:
-        sleeps.append(dt)
-
-    monkeypatch.setattr("shikigami.hal.picrawler.soft.time.sleep", _sleep)
-    c = SoftPicrawler(frame_delay_s=0.1)
-    c.display_hz = 30.0
+    monkeypatch.setattr("shikigami.hal.picrawler.soft.time.sleep", sleeps.append)
+    c = SoftPicrawler(realtime=True)
+    c.do_step([[45.0, 45.0, -50.0]] * 4, speed=50)  # from all-zero servos: a big move
+    assert sum(sleeps) == pytest.approx(0.50, abs=0.011)  # robot_hat: 1000 - 9.9 * 50 ms
+    sleeps.clear()
     c.get_playback_speed = lambda: 2.0
-    # Start from a different pose so lerp has work to do.
-    c.current_coord = [[0.0, 0.0, -50.0] for _ in range(4)]
-    c.do_step([[45.0, 45.0, -50.0]] * 4, speed=50)
-    # duration = 0.1 / 2 = 0.05s → ~2 samples at 30 Hz; sleeps sum to duration.
-    assert sleeps
-    assert abs(sum(sleeps) - 0.05) < 1e-9
+    c.do_step([[45.0, 0.0, -50.0]] * 4, speed=50)
+    assert sum(sleeps) == pytest.approx(0.25, abs=0.006)
 
 
-def test_soft_interpolates_at_display_hz(monkeypatch):
+def test_realtime_moves_joints_not_feet_in_straight_lines(monkeypatch):
+    """Servos interpolate in joint space, so a sideways foot move bows outward."""
     monkeypatch.setattr("shikigami.hal.picrawler.soft.time.sleep", lambda _dt: None)
-    c = SoftPicrawler(frame_delay_s=0.1)
+    c = SoftPicrawler(realtime=True)
+    c.realtime = False
+    c.do_step([[45.0, 45.0, -50.0]] * 4)
+    c.realtime = True
     c.display_hz = 30.0
-    c.current_coord = [[0.0, 0.0, -50.0] for _ in range(4)]
-    poses: list[list[list[float]]] = []
+    poses: list[list[float]] = []
+    c.on_pose = lambda: poses.append(list(c.current_step_all_leg_value()[0]))
+    c.do_step([[45.0, 0.0, -50.0]] + [[45.0, 45.0, -50.0]] * 3, speed=50)
+    assert len(poses) == 15  # 0.5 s at 30 Hz
+    assert poses[-1] == pytest.approx([45.0, 0.0, -50.0])
+    mid = poses[len(poses) // 2]
+    # A straight line would keep x at 45; the arc swings the foot inward.
+    assert abs(mid[0] - 45.0) > 1.0
 
-    def _capture() -> None:
-        poses.append([list(leg) for leg in c.current_step_all_leg_value()])
 
-    c.on_pose = _capture
-    c.do_step([[45.0, 45.0, -50.0]] * 4, speed=50)
-    # 0.1s @ 30 Hz → 3 published samples (not a single snap).
-    assert len(poses) == 3
-    assert poses[0] != poses[-1]
-    # Mid sample is between start and end on X.
-    assert 0.0 < poses[0][0][0] < poses[-1][0][0]
+def test_lifted_leg_is_marked_swinging():
+    c = SoftPicrawler()
+    c.do_step([[45.0, 45.0, -50.0], [45.0, 0.0, -50.0], [45.0, 0.0, -50.0], [45.0, 45.0, -50.0]])
+    c.do_step([[45.0, 45.0, -50.0], [70.0, 0.0, -30.0], [45.0, 0.0, -50.0], [45.0, 45.0, -50.0]])
+    assert c.swing == [False, True, False, False]
 
 
 def test_soft_on_pose_fires_each_frame():
-    c = SoftPicrawler(frame_delay_s=0.0)
+    c = SoftPicrawler()
     poses: list[list[list[float]]] = []
 
     def _capture() -> None:

@@ -92,8 +92,8 @@ class PicrawlerHAL(HAL):
         soft = not _HAS_PICRAWLER
         if soft:
             log.info("SunFounder picrawler not installed — using SoftPicrawler")
-            # ~150 ms per gait keyframe, lerped at 30 Hz for smooth BODY motion.
-            crawler: Any = SoftPicrawler(DEFAULT_PINS, frame_delay_s=0.15)
+            # Keyframes play at the robot's own servo speed, sampled at 30 Hz.
+            crawler: Any = SoftPicrawler(DEFAULT_PINS, realtime=True)
             crawler.display_hz = 30.0
             eyes_cfg = EyesConfig.from_mapping(cfg.eyes.model_dump()).apply_personality()
             self.state = SimState(backend="picrawler")
@@ -114,11 +114,10 @@ class PicrawlerHAL(HAL):
             )
             motion: Motion = PicrawlerMotion(crawler, log, state=self.state)
             crawler.get_playback_speed = lambda: float(self.state.playback_speed)
-            delay = crawler.frame_delay_s
-            crawler.frame_delay_s = 0.0
+            crawler.realtime = False
             crawler.do_step("stand", 80)
             motion._publish("stand")
-            crawler.frame_delay_s = delay
+            crawler.realtime = True
             super().__init__(
                 backend="picrawler",
                 motion=motion,

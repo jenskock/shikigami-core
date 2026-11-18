@@ -28,6 +28,9 @@ class _Motion:
     async def stand(self) -> None:
         await self._do("stand")
 
+    async def settle(self) -> None:
+        await self._do("settle")
+
     async def lie(self) -> None:
         await self._do("lie")
 
@@ -85,7 +88,7 @@ def test_emote_plays_its_gesture_without_holding_the_turn(tmp_path):
         await _settle(app)
 
     asyncio.run(run())
-    assert motion.calls == ["look left", "look right", "stand"]
+    assert motion.calls == ["look left", "look right", "settle"]
 
 
 def test_neutral_and_disabled_gestures_keep_the_body_still(tmp_path):
@@ -119,7 +122,7 @@ def test_gesture_yields_to_a_requested_move(tmp_path):
         await asyncio.sleep(0)
         await app.execute(MoveAction(motion="walk"))
         await _settle(app)
-        assert motion.calls == ["look up", "stand", "walk forward"]
+        assert motion.calls == ["look up", "settle", "walk forward"]
 
     asyncio.run(run())
 

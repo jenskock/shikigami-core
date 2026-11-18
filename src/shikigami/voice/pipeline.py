@@ -378,6 +378,16 @@ class CompatibleLLMService(OpenAILLMService):
     """
 
     supports_developer_role = False
+    # Spoken text of the response being generated. Tool handlers read it to tell a
+    # wordless, tool-only response apart (see voice.tools: they then ask for words).
+    response_text = ""
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self.response_text = ""
+        elif isinstance(frame, LLMTextFrame):
+            self.response_text += frame.text
+        await super().push_frame(frame, direction)
 
     def build_chat_completion_params(self, params_from_context):
         params = super().build_chat_completion_params(params_from_context)
@@ -442,6 +452,13 @@ class VoiceSession(ToolHooks):
         # Counts turns, so a body tool that outlives its turn cannot close the next.
         self._turn = 0
         self._bot_speaking = False
+        self._user_speaking = False  # VAD says the human is talking right now
+        self.last_turn_t = 0.0  # monotonic end of the last turn (0 = none yet)
+        self._user_msgs = 0  # user messages in the context (one per thing to answer)
+        self._nudged_at = -1  # _user_msgs when we last asked for words after tools
+        # A tool asked for one more completion (run_llm=True). Pipecat sends it straight
+        # back to the LLM, past the TurnGate, so the turn must stay open until it ran.
+        self._followup_pending = False
         # True only after LLMFullResponseEndFrame (tools already ran).
         self._llm_done = True
         self._reply = ""
@@ -483,6 +500,24 @@ class VoiceSession(ToolHooks):
     async def execute(self, action: Action) -> None:
         await self._execute_action(action)
 
+    def nudge_for_words(self) -> bool:
+        """A response was only tool calls (often just an emote): run the LLM once more.
+
+        Claude tends to call emote first and would speak after the tool result, but
+        body tools don't run the LLM again, so the turn ended silent. One follow-up
+        per user message, so a model that keeps answering with tools can't loop.
+        """
+        if self._nudged_at == self._user_msgs:
+            return False
+        self._nudged_at = self._user_msgs
+        self._log.info("response had only tool calls — asking the model for words")
+        self.expect_followup()
+        return True
+
+    def expect_followup(self) -> None:
+        """A tool result will run the LLM again: keep this turn open until it has."""
+        self._followup_pending = True
+
     def tool_enter(self) -> int:
         """A body tool started. Returns the turn it belongs to, for ``tool_exit``."""
         self._tools += 1
@@ -518,6 +553,7 @@ class VoiceSession(ToolHooks):
 
     def note_llm_started(self) -> None:
         self._llm_done = False
+        self._followup_pending = False  # the awaited follow-up (if any) is this one
         self._ui(status="thinking")
 
     def note_llm_finished(self) -> None:
@@ -542,6 +578,9 @@ class VoiceSession(ToolHooks):
             messages[0]["content"] = content
         else:
             messages.insert(0, {"role": "system", "content": content})
+        self._user_msgs = sum(
+            1 for m in messages if isinstance(m, dict) and m.get("role") == "user"
+        )
         for message in reversed(messages):
             if isinstance(message, dict) and message.get("role") == "user":
                 text = message.get("content")
@@ -559,6 +598,7 @@ class VoiceSession(ToolHooks):
     def mark_busy(self) -> None:
         self._turn += 1
         self._tools = 0
+        self._followup_pending = False
         self._bot_speaking = False
         self._llm_done = False
         self._reply = ""
@@ -597,6 +637,7 @@ class VoiceSession(ToolHooks):
         self.last_summary = summary
         self._log.info("turn done — %s", summary)
         self._ui(status="idle", last_latency=summary)
+        self.last_turn_t = time.monotonic()
         self._idle.set()
 
     async def start(self) -> None:
@@ -641,6 +682,35 @@ class VoiceSession(ToolHooks):
         )
         await self.wait_idle()
         return self._reply
+
+    @property
+    def can_speak_up(self) -> bool:
+        """A good moment to start talking on our own: nothing in flight, nobody talking."""
+        return (
+            self._worker is not None
+            and not self._cfg.llm.mock
+            and self.idle
+            and not self._bot_speaking
+            and not self._user_speaking
+        )
+
+    async def notice(self, note: str) -> bool:
+        """Start a turn the robot begins itself (a greeting, a question).
+
+        ``note`` tells the model what it noticed. It goes in as a user message (Claude
+        on Requesty needs one) marked as not spoken by the human. Never waits: if this
+        is not a good moment, nothing happens and it returns False.
+        """
+        if not self.can_speak_up:
+            return False
+        assert self._worker is not None
+        text = f"(Nobody said this. You noticed it yourself: {note})"
+        self._input = text
+        self.mark_busy()  # owns the idle flag now; no await happened since the check
+        await self._worker.queue_frame(
+            LLMMessagesAppendFrame([{"role": "user", "content": text}], run_llm=True)
+        )
+        return True
 
     async def _mock_turn(self, text: str) -> str:
         self.mark_busy()
@@ -705,11 +775,13 @@ class VoiceSession(ToolHooks):
 
         @pair.user().event_handler("on_user_turn_started")
         async def _listening(_aggregator, _strategy) -> None:
+            self._user_speaking = True
             if self.idle:
                 self._ui(status="listening")
 
         @pair.user().event_handler("on_user_turn_stopped")
         async def _heard(_aggregator, _strategy, message) -> None:
+            self._user_speaking = False
             text = (message.content or "").strip()
             if text:
                 self._log.info("heard: %s", text)
@@ -829,7 +901,7 @@ class VoiceSession(ToolHooks):
     def _check_done(self) -> None:
         # Wait for LLMFullResponseEndFrame and every body tool handler exited.
         # Playback is not a lock — Status speaking is visual only.
-        if not self._llm_done or self._tools > 0:
+        if not self._llm_done or self._tools > 0 or self._followup_pending:
             return
         if self._input.strip() and not self._reply.strip() and not self._action_types:
             # Nothing is said in the model's place. Reasoning tokens count

@@ -2,7 +2,8 @@
 
 Status: phases 1–3 implemented (2026-11-18) — camera contract, Mac emulation, YuNet perception,
 face tracks + SFace recognition, person_arrived/left, remember_face/forget_face, enroll script,
-look() tool (snapshot -> vision model). Phases 4–5 not started.
+look() tool (snapshot -> vision model), proactive greetings with cooldowns + quiet mode
+(brain/attention.py). Phase 5 not started.
 
 ## Goals
 

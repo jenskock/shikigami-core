@@ -26,7 +26,10 @@ class SimState:
         self.body_x: float = 0.0
         self.body_y: float = 0.0
         self.body_yaw_deg: float = 0.0
-        # SoftPicrawler animation pace multiplier (1.0 = default frame delay).
+        # Everything the BODY view draws, replaced as one object per pose so the
+        # view never reads half of one frame and half of the next.
+        self.body_pose: object | None = None
+        # SoftPicrawler animation pace multiplier (1.0 = the robot's own speed).
         self.playback_speed: float = 1.0
         self.tool_log: list[str] = []  # dashboard TOOLS panel (newest last)
 

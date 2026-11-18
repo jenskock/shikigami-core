@@ -30,6 +30,7 @@ class ActionType(StrEnum):
     EMOTE = "emote"
     REMEMBER = "remember"
     IDLE = "idle"
+    QUIET = "quiet"
 
 
 class MoveAction(BaseModel):
@@ -63,8 +64,13 @@ class IdleAction(BaseModel):
     seconds: float = 5.0
 
 
+class QuietAction(BaseModel):
+    type: Literal[ActionType.QUIET] = ActionType.QUIET
+    minutes: float | None = None  # None = default; 0 = may speak up again
+
+
 Action = Annotated[
-    MoveAction | SayAction | EmoteAction | RememberAction | IdleAction,
+    MoveAction | SayAction | EmoteAction | RememberAction | IdleAction | QuietAction,
     Field(discriminator="type"),
 ]
 ACTION_ADAPTER: TypeAdapter[Action] = TypeAdapter(Action)
@@ -190,6 +196,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {"seconds": {"type": "number", "minimum": 0}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "quiet",
+            "description": (
+                "Stop speaking up on your own (greetings, questions) for a while, when "
+                'the human asks you to be quiet ("sei mal still", "lass mich in Ruhe"). '
+                "minutes=0 when they say you may talk again. You still answer when spoken to."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "How long. Omit for the default; 0 = talk again.",
+                    }
+                },
             },
         },
     },

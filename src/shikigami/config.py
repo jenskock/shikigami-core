@@ -114,6 +114,18 @@ class PerceptionConfig(BaseModel):
     look_max_tokens: int = 1536  # hidden reasoning counts too; 400 cut answers off
 
 
+class AttentionConfig(BaseModel):
+    """When Kogane speaks up on its own (greetings, asking who someone is)."""
+
+    proactive: bool = True  # off = only eyes/body react to people; speech only when asked
+    greet_cooldown_h: float = 3.0  # greet the same person at most this often (survives restarts)
+    ask_unknown: bool = True  # ask an unknown face once who they are
+    unknown_ask_cooldown_min: float = 30.0
+    min_gap_s: float = 60.0  # at least this long between two proactive lines
+    busy_window_s: float = 20.0  # a turn this recent = already talking: don't interrupt
+    quiet_default_min: float = 30.0  # "sei mal still" without a duration
+
+
 class ReflexConfig(BaseModel):
     hz: float = 20.0
     obstacle_cm: float = 25.0
@@ -160,6 +172,7 @@ class Config(BaseModel):
     sim: SimConfig = Field(default_factory=SimConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
     perception: PerceptionConfig = Field(default_factory=PerceptionConfig)
+    attention: AttentionConfig = Field(default_factory=AttentionConfig)
     reflexes: ReflexConfig = Field(default_factory=ReflexConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     personality: PersonalityRef = Field(default_factory=PersonalityRef)

@@ -33,7 +33,11 @@ class Motion(abc.ABC):
 
     @abc.abstractmethod
     async def turn(
-        self, direction: str = "left", angle_deg: float | None = None, speed: float = 0.5
+        self,
+        direction: str = "left",
+        angle_deg: float | None = None,
+        speed: float = 0.5,
+        duration_s: float | None = None,
     ) -> None: ...
 
     @abc.abstractmethod

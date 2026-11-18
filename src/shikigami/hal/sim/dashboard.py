@@ -453,12 +453,7 @@ class SimDashboard:
         view = self._body_view
         if view is None:
             return
-        view.set_pose(
-            st.leg_coords,
-            body_x=st.body_x,
-            body_y=st.body_y,
-            body_yaw_deg=st.body_yaw_deg,
-        )
+        view.set_body_pose(getattr(st, "body_pose", None))
 
     def _push_images(self) -> None:
         if self._face_dirty and self._face_label is not None:

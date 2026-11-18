@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 
-from .app.bus import EventBus
+from .app.bus import NOT_PERSISTED, EventBus
 from .app.loop import App
 from .brain.agent import Brain
 from .config import REPO_ROOT, Config, load_config
@@ -51,7 +51,8 @@ def build_app(cfg: Config, log: logging.Logger) -> App:
     bus = EventBus()
 
     async def _persist(e) -> None:
-        memory.log_event(e.kind, e.payload)
+        if e.kind not in NOT_PERSISTED:
+            memory.log_event(e.kind, e.payload)
 
     bus.subscribe("*", _persist)
     return App(cfg, hal, brain, memory, bus, log=log)

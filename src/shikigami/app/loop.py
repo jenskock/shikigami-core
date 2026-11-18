@@ -14,11 +14,13 @@ from ..brain.actions import (
     EmoteAction,
     IdleAction,
     MoveAction,
+    QuietAction,
     RememberAction,
     SayAction,
     format_tool_call,
 )
 from ..brain.agent import Brain
+from ..brain.attention import AttentionPolicy
 from ..config import REPO_ROOT, Config
 from ..hal.interfaces import HAL
 from ..hal.sim.state import SimState
@@ -34,14 +36,20 @@ from .bus import EventBus
 from .latency import LatencyTracker
 from .stdin_lines import StdinLines
 
-# SoftPicrawler / device gait: ~1 cycle ≈ 0.4 s (matches PicrawlerMotion.steps_for_duration).
+# Gait cycle length for backends that do not report their own.
 _SECS_PER_STEP = 0.4
 
 
-def _duration_for_move(action: MoveAction) -> float | None:
-    """Prefer explicit steps (counted strides) over duration_s."""
+def _duration_for_move(action: MoveAction, motion=None) -> float | None:
+    """Prefer explicit steps (counted strides) over duration_s.
+
+    Steps become a duration with the backend's own cycle length, so the backend
+    turns them back into the same number of steps.
+    """
     if action.steps is not None and action.steps > 0:
-        return float(action.steps) * _SECS_PER_STEP
+        cycle = getattr(motion, "cycle_secs", None)
+        secs = cycle(action.speed) if callable(cycle) else _SECS_PER_STEP
+        return float(action.steps) * secs
     return action.duration_s
 
 
@@ -49,15 +57,15 @@ def _duration_for_move(action: MoveAction) -> float | None:
 # them walks or turns the robot; each ends standing where it started.
 EMOTE_GESTURES: dict[str, tuple[str, ...]] = {
     "happy": ("wave",),
-    "love": ("look up", "stand"),
-    "curious": ("look left", "look right", "stand"),
-    "surprised": ("look up", "stand"),
-    "confused": ("look right", "stand"),
-    "scared": ("look down", "stand"),
-    "sad": ("look down", "stand"),
-    "sleepy": ("look down", "stand"),
+    "love": ("look up", "settle"),
+    "curious": ("look left", "look right", "settle"),
+    "surprised": ("look up", "settle"),
+    "confused": ("look right", "settle"),
+    "scared": ("look down", "settle"),
+    "sad": ("look down", "settle"),
+    "sleepy": ("look down", "settle"),
     "angry": ("push up", "stand"),
-    "mischievous": ("look right", "look left", "stand"),
+    "mischievous": ("look right", "look left", "settle"),
 }
 
 
@@ -87,6 +95,7 @@ class App:
         self.faces = FaceGallery()
         self.looker: Looker | None = None
         self._vision_tools: tuple[str, ...] = ()  # offered to the voice LLM
+        self.attention: AttentionPolicy | None = None
         self._reflex_task: asyncio.Task | None = None
         self._turn_lock = asyncio.Lock()  # serialize stdin / dashboard turns
         self._body_lock = asyncio.Lock()  # one body motion at a time: moves and gestures
@@ -126,6 +135,7 @@ class App:
             await self.voice.start()
             if self.voice.listening:
                 self._set_sim_state(status="idle", mic="idle")
+        self._start_attention()
         tracker = None
         if self.cfg.perception.track_faces and self.perception is not None:
             tracker = FaceTracker(
@@ -152,6 +162,28 @@ class App:
         )
         if self.brain is not None:
             await self.brain.warmup()
+
+    def _start_attention(self) -> None:
+        """Speak up on our own when people come and go (rate-limited, see attention)."""
+        voice = self.voice
+
+        async def notice(note: str) -> bool:
+            if voice is None or not await voice.notice(note):
+                return False
+            self._note_tool_marker(f"── noticed · {note[:40]} ──")
+            return True
+
+        self.attention = AttentionPolicy(
+            self.cfg.attention,
+            self.memory,
+            notice=notice,
+            can_speak=lambda: voice is not None and voice.can_speak_up,
+            last_turn=lambda: voice.last_turn_t if voice is not None else 0.0,
+            emote=self.hal.expression.emote,
+            log=logging.getLogger("shikigami.attention"),
+        )
+        self.bus.subscribe("person_arrived", self.attention.on_event)
+        self.bus.subscribe("person_left", self.attention.on_event)
 
     def _start_perception(self) -> None:
         """Detector + people (tracks, recognition) on the camera. Same on Mac and Pi."""
@@ -358,6 +390,9 @@ class App:
         elif isinstance(action, IdleAction):
             with tracker.stage("exec:idle"):
                 await asyncio.sleep(min(action.seconds, 30.0))
+        elif isinstance(action, QuietAction):
+            if self.attention is not None:
+                self.attention.set_quiet(action.minutes)
         else:
             assert_never(action)
 
@@ -387,6 +422,10 @@ class App:
                 for step in steps:
                     if step == "stand":
                         await motion.stand()
+                    elif step == "settle":
+                        # One keyframe back to standing; backends without it re-stand.
+                        settle = getattr(motion, "settle", None)
+                        await (settle() if settle is not None else motion.stand())
                     else:
                         await motion.play_action(step)
         except Exception as exc:
@@ -403,7 +442,7 @@ class App:
 
     async def _exec_move_locked(self, action: MoveAction) -> None:
         motion = self.hal.motion
-        duration_s = _duration_for_move(action)
+        duration_s = _duration_for_move(action, motion)
         match action.motion:
             case "walk" | "forward" | "backward":
                 direction = (
@@ -420,7 +459,7 @@ class App:
                     if action.motion == "turn_right"
                     else action.direction
                 )
-                await motion.turn(direction, action.angle_deg, action.speed)
+                await motion.turn(direction, action.angle_deg, action.speed, duration_s)
             case "sit":
                 await motion.sit()
             case "stand":

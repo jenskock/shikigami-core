@@ -17,6 +17,11 @@ class Event:
 
 Handler = Callable[[Event], Awaitable[None]]
 
+# Reflex-level events: they drive gaze and eyes but are not worth remembering. Each
+# camera blip makes a pair of them, and the LLM only sees the last few events, so
+# storing them pushed out the ones that matter (person_arrived, heard, looked).
+NOT_PERSISTED = frozenset({"face_seen", "face_lost"})
+
 
 class EventBus:
     def __init__(self) -> None:

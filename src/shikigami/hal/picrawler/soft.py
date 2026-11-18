@@ -4,6 +4,10 @@ Reimplements the public surface used by our HAL (`do_action`, `do_step`, `set_an
 IK, and named gaits) so Mac sim stays close to the Pi device. Geometry constants and
 gait patterns follow SunFounder's PiCrawler docs / library behaviour
 (https://github.com/sunfounder/picrawler); this module does not import that package.
+
+With ``realtime=True`` every keyframe plays the way ``robot_hat.Robot.servo_move``
+drives the servos: all joints move linearly in joint space, and the move takes as
+long as it does on the robot (see ``kinematics.keyframe_secs``).
 """
 
 from __future__ import annotations
@@ -12,6 +16,13 @@ import math
 import time
 from collections.abc import Callable
 from typing import Any
+
+from .kinematics import (
+    feet_world,
+    keyframe_secs,
+    leg_chain_local,
+    support_plane,
+)
 
 # Leg order: right-front, left-front, left-rear, right-rear
 LEG_NAMES = ("RF", "LF", "LR", "RR")
@@ -420,33 +431,37 @@ class MoveList(dict):
     def to_rad(deg: float) -> float:
         return deg * math.pi / 180
 
+    def _circle(self, step_deg: int, *, reverse: bool = False, rise=None) -> list:
+        """Body circles of radius 40 mm, one frame per ``step_deg``; ``rise(i)`` lifts z."""
+        angles = range(360, 0, -step_deg) if reverse else range(0, 360, step_deg)
+        return [
+            self.move_body_absolute(
+                40 * math.sin(self.to_rad(i)),
+                40 * math.cos(self.to_rad(i)),
+                rise(i) if rise is not None else 0,
+            )
+            for i in angles
+        ]
+
     @property
     def dance(self) -> list:
-        """Compact dance (fewer frames than upstream) — same motion vocabulary."""
+        """The robot's full dance, frame for frame (sit, circles, tilts, rising spiral)."""
         frames: list = []
         if not self.is_sit():
             frames += self.sit
-        frames.append(
-            [
-                [self.X_DEFAULT, self.Y_DEFAULT, self.z_current],
-                [self.X_DEFAULT, self.Y_DEFAULT, self.z_current],
-                [self.X_DEFAULT, self.Y_DEFAULT, self.z_current],
-                [self.X_DEFAULT, self.Y_DEFAULT, self.z_current],
-            ]
-        )
-        for i in range(0, 360, 15):
-            frames.append(
-                self.move_body_absolute(
-                    40 * math.sin(self.to_rad(i)),
-                    40 * math.cos(self.to_rad(i)),
-                    0,
-                )
-            )
+        z = self.z_current
+        frames.append([[self.X_DEFAULT, self.Y_DEFAULT, z]] * 4)
+        frames += self._circle(5)
+        frames += self._circle(5, reverse=True)
         frames.append(self.rotate_body_absolute_x(-20))
         frames.append(self.rotate_body_absolute_x(20))
         frames.append(self.move_body_absolute(0, 0, 0))
         frames.append(self.rotate_body_absolute_y(-20))
         frames.append(self.rotate_body_absolute_y(20))
+        for j in range(3):
+            frames += self._circle(3, rise=lambda i, j=j: (i / 360.0 + j) * 15)
+        for j in range(3, 0, -1):
+            frames += self._circle(3, rise=lambda i, j=j: ((360 - i) / 360.0 + j - 1) * 15)
         frames.append(self.move_body_absolute(0, 0, 0))
         return frames
 
@@ -464,11 +479,14 @@ class SoftPicrawler:
         pin_list: list[int] | None = None,
         init_angles: list[float] | None = None,
         *,
-        frame_delay_s: float = 0.0,
+        realtime: bool = False,
     ) -> None:
         self.pin_list = list(pin_list or self.PIN_LIST)
         self.move_list = MoveList()
         self.move_list_add: dict[str, list] = {"my action": None}  # type: ignore[dict-item]
+        # Built once, like the real library: do_step("stand") replays these frames
+        # and does not touch move_list.z_current, so the first gait after it
+        # stands up again — the robot does that too.
         self.step_list = {
             "stand": self.move_list["stand"],
             "sit": self.move_list["sit"],
@@ -478,12 +496,16 @@ class SoftPicrawler:
         self.coord_temp = [[60.0, 0.0, -30.0] for _ in range(4)]
         self.servo_positions = list(init_angles) if init_angles is not None else [0.0] * 12
         self.offset = [0.0] * 12
-        self.frame_delay_s = float(frame_delay_s)  # >0 = keyframe transition duration; 0 = snap
+        self.realtime = bool(realtime)  # play keyframes at the robot's speed; False = snap
         self.on_pose: Callable[[], None] | None = None
         # Live multiplier from SimState.playback_speed (dashboard Speed control).
         self.get_playback_speed: Callable[[], float] | None = None
         # Body-view sample rate while interpolating between gait keyframes.
         self.display_hz = 30.0
+        # Per leg, for the keyframe in progress: lifted at its start or end (swing),
+        # and whether its joints hit a limit.
+        self.swing: list[bool] = [False] * 4
+        self.clamped: list[bool] = [False] * 4
 
     def coord2polar(self, coord: list[float]) -> list[float]:
         x, y, z = coord
@@ -562,43 +584,51 @@ class SoftPicrawler:
             return 1.0
         return max(0.25, min(2.0, float(self.get_playback_speed())))
 
-    def _sdk_time_factor(self, speed: int) -> float:
-        # Higher SDK speed → shorter transition (speed 50 ≈ full delay).
-        return max(0.2, (110 - max(0, min(100, int(speed)))) / 60.0)
+    def _solve(
+        self, coords: list[list[float]], *, israise: bool = False
+    ) -> tuple[list[float], list[list[float]], list[bool]]:
+        """IK and joint limits for one keyframe: (servo angles, foot coords, clamped legs).
+
+        Clamped legs end where their limited joints put them, as on the robot.
+        """
+        translate: list[float] = []
+        clamped: list[bool] = []
+        for coord in coords:
+            alpha, beta, gamma = self.coord2polar(coord)
+            limited, angles = self.limit_angle([beta, alpha, gamma])
+            translate.extend(angles)
+            clamped.append(limited)
+        if any(clamped):
+            if israise:
+                raise ValueError("Coordinates out of controllable range.")
+            feet = [self.polar2coord(translate[i * 3 : i * 3 + 3]) for i in range(4)]
+        else:
+            feet = [list(c) for c in coords]
+        return translate, feet, clamped
+
+    def _commit(self, angles: list[float], coords: list[list[float]]) -> None:
+        self.servo_positions = list(angles)
+        self.current_coord = [list(c) for c in coords]
+        self.coord_temp = [list(c) for c in coords]
+        if self.on_pose is not None:
+            self.on_pose()
 
     def _commit_coords(self, coords: list[list[float]], *, israise: bool = False) -> list[float]:
         """IK + publish one pose (no sleep)."""
-        angles_temp: list[list[float]] = []
-        for coord in coords:
-            alpha, beta, gamma = self.coord2polar(coord)
-            angles_temp.append([beta, alpha, gamma])
-        translate: list[float] = []
-        limited_any = False
-        for angles in angles_temp:
-            limited, clipped = self.limit_angle(angles)
-            translate.extend(clipped)
-            limited_any = limited_any or limited
-        if limited_any:
-            if israise:
-                raise ValueError("Coordinates out of controllable range.")
-            limited_coords = []
-            for i in range(4):
-                limited_coords.append(
-                    self.polar2coord([translate[i * 3], translate[i * 3 + 1], translate[i * 3 + 2]])
-                )
-            self.current_coord = [list(c) for c in limited_coords]
-        else:
-            self.current_coord = [list(c) for c in coords]
-        self.coord_temp = [list(c) for c in self.current_coord]
-        self.servo_positions = list(translate)
-        if self.on_pose is not None:
-            self.on_pose()
-        return list(translate)
+        angles, feet, clamped = self._solve(coords, israise=israise)
+        self.clamped = clamped
+        self._commit(angles, feet)
+        return list(angles)
+
+    @staticmethod
+    def _lifted(coords: list[list[float]]) -> list[bool]:
+        support = support_plane(feet_world(coords))
+        return [not c for c in support.contact]
 
     def set_angle(
         self, angles_list: list[list[float]], speed: int = 50, israise: bool = False
     ) -> list[float]:
-        """Snap (or legacy path): apply joint angles immediately, optional post sleep."""
+        """Apply joint angles; in realtime mode wait as long as the servos would take."""
         translate: list[float] = []
         limited_any = False
         for angles in angles_list:
@@ -616,21 +646,22 @@ class SoftPicrawler:
             self.current_coord = [list(c) for c in coords]
         else:
             self.current_coord = [list(c) for c in self.coord_temp]
+        max_delta = max(
+            (abs(a - b) for a, b in zip(translate, self.servo_positions, strict=False)),
+            default=0.0,
+        )
         self.servo_positions = list(translate)
         if self.on_pose is not None:
             self.on_pose()
-        delay = self.frame_delay_s
-        if delay > 0:
-            time.sleep(delay * self._sdk_time_factor(speed) / self._playback_speed())
+        if self.realtime:
+            time.sleep(keyframe_secs(max_delta, speed) / self._playback_speed())
         return list(translate)
 
     def do_step(self, _step: str | list, speed: int = 50, israise: bool = False) -> None:
         if isinstance(_step, str):
             if _step not in self.step_list:
                 raise KeyError(f"Unknown step gait: {_step!r}")
-            # Refresh named steps from live MoveList (stand/sit mutate z_current).
-            frames = self.move_list[_step]
-            for one_step in frames:
+            for one_step in self.step_list[_step]:
                 self._apply_coords(one_step, speed, israise)
             return
         if isinstance(_step, list):
@@ -639,37 +670,40 @@ class SoftPicrawler:
         raise TypeError(f'Invalid "_step" parameter: {type(_step)!r}')
 
     def _apply_coords(self, one_step: list, speed: int, israise: bool = False) -> None:
-        """Move to a keyframe; when animating, lerp foot tips at ``display_hz``."""
+        """Move to one keyframe the way ``servo_move`` does on the robot.
+
+        Every joint moves linearly from its current angle to its target, so the
+        feet travel along the arcs the real legs make, and the move takes as long
+        as on the robot. Poses are published at ``display_hz``.
+        """
         target = [[float(v) for v in leg[:3]] for leg in one_step]
         if len(target) != 4:
             raise ValueError(f"expected 4 leg coords, got {len(target)}")
+        angles, feet, clamped = self._solve(target, israise=israise)
+        start_angles = list(self.servo_positions)
+        start_feet = [list(c) for c in self.current_coord]
+        self.clamped = clamped
+        lifted_start = self._lifted(start_feet) if len(start_feet) == 4 else [False] * 4
+        lifted_end = self._lifted(feet)
+        self.swing = [a or b for a, b in zip(lifted_start, lifted_end, strict=True)]
 
-        delay = self.frame_delay_s
-        if delay <= 0:
-            self._commit_coords(target, israise=israise)
+        if not self.realtime or len(start_angles) != 12:
+            self._commit(angles, feet)
             return
 
-        start = [list(c) for c in self.current_coord]
-        if len(start) != 4:
-            start = [list(c) for c in target]
-
-        duration = delay * self._sdk_time_factor(speed) / self._playback_speed()
-        hz = max(1.0, float(self.display_hz))
-        n = max(1, int(round(duration * hz)))
+        max_delta = max(abs(a - b) for a, b in zip(angles, start_angles, strict=True))
+        duration = keyframe_secs(max_delta, speed) / self._playback_speed()
+        n = max(1, int(round(duration * max(1.0, float(self.display_hz)))))
         step_dt = duration / n
         for i in range(1, n + 1):
-            t = i / n
-            lerped = [
-                [
-                    start[li][0] + (target[li][0] - start[li][0]) * t,
-                    start[li][1] + (target[li][1] - start[li][1]) * t,
-                    start[li][2] + (target[li][2] - start[li][2]) * t,
-                ]
-                for li in range(4)
-            ]
-            self._commit_coords(lerped, israise=israise)
-            if step_dt > 0:
-                time.sleep(step_dt)
+            if i == n:
+                self._commit(angles, feet)
+            else:
+                t = i / n
+                pose = [s0 + (s1 - s0) * t for s0, s1 in zip(start_angles, angles, strict=True)]
+                tips = [list(leg_chain_local(pose[k * 3 : k * 3 + 3])[3]) for k in range(4)]
+                self._commit(pose, tips)
+            time.sleep(step_dt)
 
     def current_step_all_leg_angle(self) -> list[float]:
         return list(self.servo_positions)

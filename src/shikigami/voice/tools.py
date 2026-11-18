@@ -109,10 +109,11 @@ def build_tool_schemas(hooks: ToolHooks) -> list[FunctionSchema]:
                 finally:
                     running.pop(call_id, None)
                     stopped.discard(call_id)
-                # Actuators are not data tools: do not run a follow-up completion.
+                # Actuators are not data tools: no follow-up completion — unless the
+                # response had no words at all, then once, so the robot speaks.
                 await params.result_callback(
                     {"ok": True},
-                    properties=FunctionCallResultProperties(run_llm=False),
+                    properties=FunctionCallResultProperties(run_llm=_needs_words(hooks, params)),
                 )
             except Exception as exc:
                 _log.warning("tool %s failed: %s", name, type(exc).__name__)
@@ -173,7 +174,7 @@ def build_tool_schemas(hooks: ToolHooks) -> list[FunctionSchema]:
                     description=spec["description"],
                     properties=spec["properties"],
                     required=spec["required"],
-                    handler=_vision_handler(vision_tool),
+                    handler=_vision_handler(vision_tool, hooks),
                 )
             )
     for spec in TOOL_SCHEMAS:
@@ -191,23 +192,43 @@ def build_tool_schemas(hooks: ToolHooks) -> list[FunctionSchema]:
     return schemas
 
 
-def _vision_handler(vision_tool: VisionTool):
+def _needs_words(hooks, params: FunctionCallParams) -> bool:
+    """True once if this response spoke no words (tool calls only)."""
+    if str(getattr(params.llm, "response_text", "") or "").strip():
+        return False
+    nudge = getattr(hooks, "nudge_for_words", None)
+    return bool(nudge is not None and nudge())
+
+
+def _vision_handler(vision_tool: VisionTool, hooks):
     @tool_options(cancel_on_interruption=False)
     async def handler(params: FunctionCallParams) -> None:
+        # Count as a running tool like body tools, so the turn stays open while a
+        # look (1-3 s) or an enrollment runs.
+        turn = hooks.tool_enter()
         try:
-            result = await vision_tool(params.function_name, dict(params.arguments))
-        except Exception as exc:
-            _log.warning("tool %s failed: %s", params.function_name, exc)
-            result = {"ok": False, "error": str(exc)}
-        # "say": the tool already has the spoken answer (look) — speak it here instead
-        # of a second completion, which often answered with only an emote. Otherwise
-        # the reply was already spoken on success; on failure the LLM says what failed.
-        say = str(result.pop("say", "") or "").strip()
-        if say:
-            await params.llm.push_frame(speak_frame(say))
-        run_llm = bool(result.pop("run_llm", not result.get("ok", False)))
-        await params.result_callback(
-            result, properties=FunctionCallResultProperties(run_llm=run_llm)
-        )
+            await _vision_call(vision_tool, hooks, params)
+        finally:
+            hooks.tool_exit(turn)
 
     return handler
+
+
+async def _vision_call(vision_tool: VisionTool, hooks, params: FunctionCallParams) -> None:
+    try:
+        result = await vision_tool(params.function_name, dict(params.arguments))
+    except Exception as exc:
+        _log.warning("tool %s failed: %s", params.function_name, exc)
+        result = {"ok": False, "error": str(exc)}
+    # "say": the tool already has the spoken answer (look) — speak it here instead
+    # of a second completion, which often answered with only an emote. Otherwise
+    # the reply was already spoken on success; on failure the LLM says what failed.
+    say = str(result.pop("say", "") or "").strip()
+    if say:
+        await params.llm.push_frame(speak_frame(say))
+    run_llm = bool(result.pop("run_llm", not result.get("ok", False)))
+    if not run_llm and not say:
+        run_llm = _needs_words(hooks, params)
+    elif run_llm and (expect := getattr(hooks, "expect_followup", None)) is not None:
+        expect()
+    await params.result_callback(result, properties=FunctionCallResultProperties(run_llm=run_llm))

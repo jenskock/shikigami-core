@@ -97,6 +97,16 @@ perception:
   look_timeout_s: 12
   look_max_tokens: 1536 # hidden reasoning counts too; 400 cut answers off
 
+# Speaking up on its own (phase 4). Eyes/body always react; speech is rate-limited.
+attention:
+  proactive: true # greet known people, ask unknown ones who they are
+  greet_cooldown_h: 3 # per person, remembered across restarts
+  ask_unknown: true
+  unknown_ask_cooldown_min: 30
+  min_gap_s: 60 # between two proactive lines
+  busy_window_s: 20 # don't butt in right after a conversation turn
+  quiet_default_min: 30 # "sei mal still" without a duration
+
 reflexes:
   hz: 20 # fast local loop, no network
   obstacle_cm: 25 # stop when something is closer than this

@@ -105,6 +105,20 @@ class MemoryStore:
         row = self._db.execute("SELECT value FROM kv WHERE key='mood'").fetchone()
         return row["value"] if row else default
 
+    # -- small key/value state (e.g. when someone was last greeted) ---------------------
+
+    def set_value(self, key: str, value: str) -> None:
+        self._db.execute(
+            "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, time.time()),
+        )
+        self._db.commit()
+
+    def get_value(self, key: str, default: str | None = None) -> str | None:
+        row = self._db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
     # -- faces (recognition embeddings; float32 vectors) -----------------------------
 
     def add_face(self, name: str, embedding: bytes) -> None:

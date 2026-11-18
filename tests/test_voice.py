@@ -454,7 +454,12 @@ def _bare_session(*, ui: list | None = None) -> VoiceSession:
     session._tools = 0
     session._turn = 0
     session._bot_speaking = False
+    session._user_speaking = False
     session._llm_done = False
+    session._followup_pending = False
+    session._user_msgs = 0
+    session._nudged_at = -1
+    session.last_turn_t = 0.0
     session._mute = MicMute()
     session._idle = asyncio.Event()
     session._idle.clear()
@@ -641,3 +646,15 @@ def test_http_client_uses_openai_timeout_not_httpx():
 
 async def _async_none():
     return None
+
+
+def test_turn_waits_for_the_followup_a_tool_asked_for():
+    """A tool result with run_llm=True runs the LLM past the gate: the turn stays open."""
+    session = _bare_session()
+    session.expect_followup()
+    session.note_llm_finished()  # first response (tools only) ended
+    assert not session.idle
+    session.note_llm_started()  # the follow-up arrives
+    session.append_reply_text("Hallo du!")
+    session.note_llm_finished()
+    assert session.idle and session._reply == "Hallo du!"

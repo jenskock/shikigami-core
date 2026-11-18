@@ -1,16 +1,14 @@
-"""Procedural 3D stick view of the PiCrawler quadruped for the sim dashboard.
+"""3D stick view of the PiCrawler for the sim dashboard.
 
-Foot tips come from SoftPicrawler / Picrawler `leg_coords` (local per-leg XYZ).
-Hips sit at the corners of a square of side `LENGTH_SIDE` (77 mm). Projection is
-a simple yaw/pitch camera with fit-to-widget scaling — no Qt3D or mesh assets.
+Each leg is drawn as the robot builds it — coxa, femur and tibia — from the
+twelve servo angles, so lifts, swings and knee bends are visible. The body
+rests on the plane its weight-bearing feet define (``kinematics.support_plane``):
+it pitches and rolls when the legs ask for that, and a lifted foot hangs in
+the air. Feet that carry weight are filled, swinging feet are hollow, and a
+leg whose joints hit a limit turns red.
 
-World pose (`body_x` / `body_y` / `body_yaw_deg`) places the robot on the floor;
-the view stays centered on the body so the grid slides underneath while walking.
-Camera yaw/zoom are manual (drag / scroll) — no auto-orbit.
-
-Gait frames are body-local (legs only). World motion comes from stance-foot
-odometry: planted feet stay fixed in world space, so the body/grid move opposite
-their body-frame motion each frame.
+The camera follows the body; the floor grid slides underneath as it walks.
+Drag sideways to orbit, up/down to change the elevation, scroll to zoom.
 """
 
 from __future__ import annotations
@@ -19,109 +17,71 @@ import math
 from collections.abc import Sequence
 
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPolygonF, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
-# Match SoftPicrawler MoveList.LENGTH_SIDE (body square edge, mm).
-BODY_SIDE = 77.0
-BODY_HALF = BODY_SIDE / 2.0
-BODY_THICKNESS = 12.0  # visual body height (mm), not from IK
-
-# RF, LF, LR, RR — same order as SoftPicrawler LEG_NAMES / current_coord.
-_HIP_XY: tuple[tuple[float, float], ...] = (
-    (BODY_HALF, BODY_HALF),  # RF
-    (-BODY_HALF, BODY_HALF),  # LF
-    (-BODY_HALF, -BODY_HALF),  # LR
-    (BODY_HALF, -BODY_HALF),  # RR
-)
-# Local X/Y sign into body frame (from move_body_absolute axis conventions).
-_LOCAL_SIGN: tuple[tuple[float, float], ...] = (
-    (1.0, 1.0),  # RF
-    (-1.0, 1.0),  # LF
-    (-1.0, -1.0),  # LR
-    (1.0, -1.0),  # RR
+from ..picrawler.kinematics import (
+    BODY_HALF,
+    BodyPose,
+    Leveler,
+    Vec3,
+    leg_chains_body,
+    rotate_yaw_xy,
+    support_plane,
 )
 
-_ELEVATION_DEG = 32.0
+BODY_THICKNESS = 12.0  # mm, drawn around the hip plane
+
+_DEFAULT_ELEVATION_DEG = 28.0
 _DEFAULT_YAW_DEG = 35.0
-_PAD_FRAC = 0.12
-# Framing radius (mm); zoom changes this via scroll.
+_PAD_FRAC = 0.1
 _REF_RADIUS_DEFAULT = 150.0
 _REF_RADIUS_MIN = 60.0
 _REF_RADIUS_MAX = 400.0
-# Fixed floor (SoftPicrawler Z_DEFAULT). Robot snaps down onto it — never flies.
-WORLD_GROUND_Z = -50.0
-_MIN_BODY_ABOVE = 20.0
-_GROUND_HALF = 220.0
-_GROUND_STEP = 32.0
+_GROUND_HALF = 240.0
+_GROUND_STEP = 30.0
 _DRAG_YAW_PER_PX = 0.35
-# Feet within this many mm of the lowest foot count as planted for odometry.
-_CONTACT_Z_EPS_MM = 8.0
+_DRAG_PITCH_PER_PX = 0.25
 
-
-def local_foot_to_body(leg_i: int, local: Sequence[float]) -> tuple[float, float, float]:
-    """Map one leg's local [x, y, z] to body-frame XYZ (Z up; local Z is already up/down)."""
-    lx, ly, lz = float(local[0]), float(local[1]), float(local[2])
-    hx, hy = _HIP_XY[leg_i]
-    sx, sy = _LOCAL_SIGN[leg_i]
-    return (hx + sx * lx, hy + sy * ly, lz)
-
-
-def feet_world(leg_coords: Sequence[Sequence[float]]) -> list[tuple[float, float, float]]:
-    """Body-frame foot positions for up to 4 legs; skips malformed entries."""
-    out: list[tuple[float, float, float]] = []
-    for i, leg in enumerate(leg_coords[:4]):
-        if len(leg) < 3:
-            continue
-        out.append(local_foot_to_body(i, leg))
-    return out
-
-
-def rotate_yaw_xy(x: float, y: float, yaw_deg: float) -> tuple[float, float]:
-    """Rotate XY around Z by yaw_deg (degrees)."""
-    yaw = math.radians(yaw_deg)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    return (x * cy - y * sy, x * sy + y * cy)
+_C_BG = QColor("#1a1d26")
+_C_GRID = QColor("#2f3444")
+_C_GRID_EDGE = QColor("#4a5063")
+_C_BODY = QColor("#3dd6c6")
+_C_LEG = QColor("#e8eaef")
+_C_LEG_FAR = QColor("#9aa0b0")
+_C_CLAMP = QColor("#ff6b6b")
+_C_SHADOW = QColor(0, 0, 0, 90)
+_C_SUPPORT = QColor(61, 214, 198, 50)
+_C_HUD = QColor("#8b90a0")
 
 
 def body_to_world(
-    point: tuple[float, float, float],
+    point: Vec3,
     body_x: float,
     body_y: float,
     body_yaw_deg: float,
-) -> tuple[float, float, float]:
-    """Map a body-frame point into world XYZ using robot pose on the floor."""
+) -> Vec3:
+    """Map a level-frame point into world XYZ using the robot's pose on the floor."""
     x, y, z = point
     wx, wy = rotate_yaw_xy(x, y, body_yaw_deg)
     return (wx + body_x, wy + body_y, z)
 
 
-def snap_to_ground(
-    feet: Sequence[tuple[float, float, float]],
-    *,
-    ground_z: float = WORLD_GROUND_Z,
-) -> tuple[list[tuple[float, float, float]], float]:
-    """Snap lowest feet to `ground_z`; return (feet, body_z). Tucked legs crouch."""
-    if not feet:
-        return [], ground_z + _MIN_BODY_ABOVE
-    min_z = min(f[2] for f in feet)
-    dz = ground_z - min_z
-    snapped = [(f[0], f[1], f[2] + dz) for f in feet]
-    body_above = max(_MIN_BODY_ABOVE, -min_z)
-    return snapped, ground_z + body_above
+def center_on_body(point: Vec3, body_x: float, body_y: float) -> Vec3:
+    """Subtract body XY so the robot stays framed while the floor slides."""
+    return (point[0] - body_x, point[1] - body_y, point[2])
 
 
 def ground_grid_lines(
-    z: float,
+    z: float = 0.0,
     *,
     half: float = _GROUND_HALF,
     step: float = _GROUND_STEP,
     origin_x: float = 0.0,
     origin_y: float = 0.0,
-) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+) -> list[tuple[Vec3, Vec3]]:
     """Axis-aligned grid segments on the Z=z plane, snapped around (origin_x, origin_y)."""
-    lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
-    # Snap grid to step boundaries so it stays world-aligned while the robot moves.
+    lines: list[tuple[Vec3, Vec3]] = []
     ox = math.floor(origin_x / step) * step
     oy = math.floor(origin_y / step) * step
     n = int(half // step)
@@ -132,166 +92,90 @@ def ground_grid_lines(
     return lines
 
 
-def hip_world(leg_i: int, body_z: float = 0.0) -> tuple[float, float, float]:
-    hx, hy = _HIP_XY[leg_i]
-    return (hx, hy, body_z)
-
-
-def body_corners(body_z: float = 0.0) -> list[tuple[float, float, float]]:
-    """Top face corners RF→LF→LR→RR at body_z; bottom face offset by -BODY_THICKNESS."""
-    top = [hip_world(i, body_z) for i in range(4)]
-    bot = [hip_world(i, body_z - BODY_THICKNESS) for i in range(4)]
-    return top + bot
-
-
-def rotate_yaw_pitch(
-    point: tuple[float, float, float], yaw_deg: float, pitch_deg: float
-) -> tuple[float, float, float]:
-    """Rotate body-frame point into camera space (yaw around Z, then pitch around X)."""
+def rotate_yaw_pitch(point: Vec3, yaw_deg: float, pitch_deg: float) -> Vec3:
+    """Rotate a point into camera space (yaw around Z, then pitch around X)."""
     x, y, z = point
     yaw = math.radians(yaw_deg)
     cy, sy = math.cos(yaw), math.sin(yaw)
     x1 = x * cy - y * sy
     y1 = x * sy + y * cy
-    z1 = z
     pitch = math.radians(pitch_deg)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    y2 = y1 * cp - z1 * sp
-    z2 = y1 * sp + z1 * cp
-    return (x1, y2, z2)
+    return (x1, y1 * cp - z * sp, y1 * sp + z * cp)
 
 
 def project_point(
-    point: tuple[float, float, float],
-    yaw_deg: float,
-    pitch_deg: float = _ELEVATION_DEG,
+    point: Vec3, yaw_deg: float, pitch_deg: float = _DEFAULT_ELEVATION_DEG
 ) -> tuple[float, float]:
-    """Orthographic project to 2D (x right, y up in view space before screen flip)."""
-    # After yaw/pitch: camera looks down -Y; screen X ← world X', screen Y ← world Z'.
+    """Orthographic projection to 2D (x right, y up before the screen flip)."""
     x_cam, _, z_cam = rotate_yaw_pitch(point, yaw_deg, pitch_deg)
     return (x_cam, z_cam)
+
+
+def depth(point: Vec3, yaw_deg: float, pitch_deg: float) -> float:
+    """Distance into the screen; larger is further away."""
+    return rotate_yaw_pitch(point, yaw_deg, pitch_deg)[1]
 
 
 def to_screen(pt: tuple[float, float], scale: float, ox: float, oy: float) -> tuple[float, float]:
     return (ox + pt[0] * scale, oy - pt[1] * scale)
 
 
-def center_on_body(
-    point: tuple[float, float, float],
-    body_x: float,
-    body_y: float,
-) -> tuple[float, float, float]:
-    """Subtract body XY so the robot stays framed while the floor slides."""
-    return (point[0] - body_x, point[1] - body_y, point[2])
+class Scene:
+    """Everything one frame draws, in the view frame (world, centred on the body)."""
+
+    def __init__(self, pose: BodyPose) -> None:
+        self.pose = pose
+        chains = leg_chains_body(pose.servo_angles)
+        feet = [chain[3] for chain in chains]
+        self.support = support_plane(feet)
+        self.level = Leveler.for_support(self.support)
+        self.chains = [[self._view(p) for p in chain] for chain in chains]
+        top = [self._view((hx, hy, BODY_THICKNESS / 2)) for hx, hy in _corners()]
+        bottom = [self._view((hx, hy, -BODY_THICKNESS / 2)) for hx, hy in _corners()]
+        self.body_top, self.body_bottom = top, bottom
+        self.nose = self._view((0.0, BODY_HALF + 14.0, BODY_THICKNESS / 2))
+        self.centre = self._view((0.0, 0.0, 0.0))
+
+    def _view(self, p: Vec3) -> Vec3:
+        pose = self.pose
+        world = body_to_world(self.level.apply(p), pose.body_x, pose.body_y, pose.body_yaw_deg)
+        return center_on_body(world, pose.body_x, pose.body_y)
+
+    @property
+    def contact(self) -> tuple[bool, ...]:
+        return self.support.contact
 
 
-def _angle_delta_deg(from_deg: float, to_deg: float) -> float:
-    """Signed shortest delta from → to in degrees (−180, 180]."""
-    return (to_deg - from_deg + 180.0) % 360.0 - 180.0
-
-
-def planted_indices(
-    feet: Sequence[tuple[float, float, float]],
-    *,
-    contact_z_eps: float = _CONTACT_Z_EPS_MM,
-) -> list[int]:
-    """Indices of feet near the lowest Z (treated as on the ground)."""
-    if not feet:
-        return []
-    min_z = min(f[2] for f in feet)
-    return [i for i, f in enumerate(feet) if f[2] <= min_z + contact_z_eps]
-
-
-def integrate_stance_odometry(
-    prev_feet: Sequence[tuple[float, float, float]] | None,
-    curr_feet: Sequence[tuple[float, float, float]],
-    body_x: float,
-    body_y: float,
-    body_yaw_deg: float,
-    *,
-    contact_z_eps: float = _CONTACT_Z_EPS_MM,
-) -> tuple[float, float, float]:
-    """Keep planted feet world-fixed; return updated (body_x, body_y, body_yaw_deg).
-
-    SoftPicrawler publishes body-frame foot tips only. When a planted foot slides
-    in that frame, the body must move the opposite way in the world so the foot
-    sticks to the floor — classic stance-foot / contact odometry.
-    """
-    if prev_feet is None or len(prev_feet) != len(curr_feet) or len(curr_feet) < 1:
-        return body_x, body_y, body_yaw_deg
-
-    prev_plant = planted_indices(prev_feet, contact_z_eps=contact_z_eps)
-    curr_plant = planted_indices(curr_feet, contact_z_eps=contact_z_eps)
-    shared = [i for i in curr_plant if i in prev_plant]
-    if not shared:
-        return body_x, body_y, body_yaw_deg
-
-    dyaw = 0.0
-    if len(shared) >= 2:
-        i0, i1 = shared[0], shared[1]
-        a0 = math.degrees(
-            math.atan2(
-                prev_feet[i1][1] - prev_feet[i0][1],
-                prev_feet[i1][0] - prev_feet[i0][0],
-            )
-        )
-        a1 = math.degrees(
-            math.atan2(
-                curr_feet[i1][1] - curr_feet[i0][1],
-                curr_feet[i1][0] - curr_feet[i0][0],
-            )
-        )
-        # Chord rotated in body frame → body yaw moves opposite to keep world chord fixed.
-        dyaw = -_angle_delta_deg(a0, a1)
-
-    # Average planted-foot motion in body frame (translation of contact set).
-    adx = sum(curr_feet[i][0] - prev_feet[i][0] for i in shared) / len(shared)
-    ady = sum(curr_feet[i][1] - prev_feet[i][1] for i in shared) / len(shared)
-    # Rotate into world using yaw before this frame's turn, then invert.
-    wx, wy = rotate_yaw_xy(adx, ady, body_yaw_deg)
-    return body_x - wx, body_y - wy, (body_yaw_deg + dyaw) % 360.0
+def _corners() -> list[tuple[float, float]]:
+    return [
+        (BODY_HALF, BODY_HALF),
+        (-BODY_HALF, BODY_HALF),
+        (-BODY_HALF, -BODY_HALF),
+        (BODY_HALF, -BODY_HALF),
+    ]
 
 
 class BodyView(QWidget):
-    """Qt widget: stick quadruped driven by `leg_coords` + world pose."""
+    """Qt widget: the crawler from its servo angles, standing on its support plane."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._feet: list[tuple[float, float, float]] = []
-        self._raw: list[list[float]] = []
-        self._body_x = 0.0
-        self._body_y = 0.0
-        self._body_yaw_deg = 0.0
+        self._pose: BodyPose | None = None
+        self._scene: Scene | None = None
         self._cam_yaw = _DEFAULT_YAW_DEG
+        self._cam_pitch = _DEFAULT_ELEVATION_DEG
         self._ref_radius = _REF_RADIUS_DEFAULT
         self._drag_last: QPointF | None = None
         self.setMinimumSize(200, 280)
         self.setAutoFillBackground(False)
-        self.setMouseTracking(False)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
-    def set_pose(
-        self,
-        leg_coords: Sequence[Sequence[float]],
-        *,
-        body_x: float = 0.0,
-        body_y: float = 0.0,
-        body_yaw_deg: float = 0.0,
-    ) -> None:
-        raw = [[float(x) for x in leg[:3]] for leg in leg_coords if len(leg) >= 3]
-        pose_same = (
-            raw == self._raw
-            and body_x == self._body_x
-            and body_y == self._body_y
-            and body_yaw_deg == self._body_yaw_deg
-        )
-        if pose_same:
+    def set_body_pose(self, pose: BodyPose | None) -> None:
+        if pose is None or pose is self._pose or len(pose.servo_angles) < 12:
             return
-        self._raw = raw
-        self._feet = feet_world(raw)
-        self._body_x = float(body_x)
-        self._body_y = float(body_y)
-        self._body_yaw_deg = float(body_yaw_deg)
+        self._pose = pose
+        self._scene = Scene(pose)
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -306,8 +190,9 @@ class BodyView(QWidget):
             super().mouseMoveEvent(event)
             return
         pos = event.position()
-        dx = pos.x() - self._drag_last.x()
-        self._cam_yaw = (self._cam_yaw + dx * _DRAG_YAW_PER_PX) % 360.0
+        self._cam_yaw = (self._cam_yaw + (pos.x() - self._drag_last.x()) * _DRAG_YAW_PER_PX) % 360
+        pitch = self._cam_pitch + (pos.y() - self._drag_last.y()) * _DRAG_PITCH_PER_PX
+        self._cam_pitch = max(5.0, min(85.0, pitch))
         self._drag_last = pos
         self.update()
         event.accept()
@@ -324,7 +209,6 @@ class BodyView(QWidget):
         if delta == 0:
             event.ignore()
             return
-        # Scroll up → zoom in (smaller framing radius).
         factor = 0.9 if delta > 0 else 1.1
         self._ref_radius = max(_REF_RADIUS_MIN, min(_REF_RADIUS_MAX, self._ref_radius * factor))
         self.update()
@@ -333,83 +217,143 @@ class BodyView(QWidget):
     def paintEvent(self, event: object) -> None:  # noqa: ARG002
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        w, h = float(self.width()), float(self.height())
-        painter.fillRect(self.rect(), QColor("#1a1d26"))
-
-        if not self._feet:
-            painter.setPen(QColor("#8b90a0"))
+        painter.fillRect(self.rect(), _C_BG)
+        scene = self._scene
+        if scene is None:
+            painter.setPen(_C_HUD)
             painter.drawText(
-                self.rect(),
-                int(Qt.AlignmentFlag.AlignCenter),
-                "no pose yet\n(move to publish)",
+                self.rect(), int(Qt.AlignmentFlag.AlignCenter), "no pose yet\n(move to publish)"
             )
             painter.end()
             return
+        self._paint_scene(painter, scene)
+        painter.end()
 
-        yaw = self._cam_yaw
-        bx, by, byaw = self._body_x, self._body_y, self._body_yaw_deg
-        feet_body, body_z = snap_to_ground(self._feet)
-        hips_body = [hip_world(i, body_z) for i in range(len(feet_body))]
-        corners_body = body_corners(body_z)
-        ground_z = WORLD_GROUND_Z
+    def _paint_scene(self, painter: QPainter, scene: Scene) -> None:
+        w, h = float(self.width()), float(self.height())
+        yaw, pitch = self._cam_yaw, self._cam_pitch
+        scale = min(w, h) * (1.0 - 2.0 * _PAD_FRAC) / (2.0 * self._ref_radius)
+        # Aim at a point a little above the floor so the robot sits mid-frame.
+        aim = project_point((0.0, 0.0, scene.level.height * 0.5), yaw, pitch)
+        ox, oy = w / 2.0 - aim[0] * scale, h / 2.0 + aim[1] * scale
 
-        def to_view(p_body: tuple[float, float, float]) -> tuple[float, float, float]:
-            return center_on_body(body_to_world(p_body, bx, by, byaw), bx, by)
-
-        feet = [to_view(f) for f in feet_body]
-        hips = [to_view(hpt) for hpt in hips_body]
-        corners = [to_view(c) for c in corners_body]
-
-        usable = min(w, h) * (1.0 - 2.0 * _PAD_FRAC)
-        scale = usable / (2.0 * self._ref_radius)
-        ox, oy = w / 2.0, h / 2.0
-
-        def scr(p3: tuple[float, float, float]) -> QPointF:
-            x, y = to_screen(project_point(p3, yaw), scale, ox, oy)
+        def scr(p: Vec3) -> QPointF:
+            x, y = to_screen(project_point(p, yaw, pitch), scale, ox, oy)
             return QPointF(x, y)
 
-        pen_ground = QPen(QColor("#2f3444"))
-        pen_ground.setWidth(1)
-        painter.setPen(pen_ground)
-        for a, b in ground_grid_lines(ground_z, origin_x=bx, origin_y=by):
-            a_v = center_on_body(a, bx, by)
-            b_v = center_on_body(b, bx, by)
-            painter.drawLine(scr(a_v), scr(b_v))
-        pen_ground_edge = QPen(QColor("#8b90a0"))
-        pen_ground_edge.setWidth(1)
-        painter.setPen(pen_ground_edge)
-        gh = _GROUND_HALF
-        edge = [
-            (bx - gh, by - gh, ground_z),
-            (bx + gh, by - gh, ground_z),
-            (bx + gh, by + gh, ground_z),
-            (bx - gh, by + gh, ground_z),
-        ]
-        for i in range(4):
-            painter.drawLine(
-                scr(center_on_body(edge[i], bx, by)),
-                scr(center_on_body(edge[(i + 1) % 4], bx, by)),
-            )
+        pose = scene.pose
+        self._paint_floor(painter, scr, pose)
 
-        top, bot = corners[:4], corners[4:]
-        pen_body = QPen(QColor("#3dd6c6"))
-        pen_body.setWidth(2)
-        painter.setPen(pen_body)
+        # Shadow of the body and the triangle or square the robot stands on.
+        shadow = QPolygonF([scr((p[0], p[1], 0.0)) for p in scene.body_bottom])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_C_SHADOW)
+        painter.drawPolygon(shadow)
+        planted = [
+            (chain[3][0], chain[3][1], 0.0)
+            for chain, down in zip(scene.chains, scene.contact, strict=False)
+            if down
+        ]
+        if len(planted) >= 3:
+            painter.setBrush(_C_SUPPORT)
+            painter.drawPolygon(QPolygonF([scr(p) for p in _convex_order(planted)]))
+        painter.setBrush(_C_HUD)
+        painter.drawEllipse(scr((scene.centre[0], scene.centre[1], 0.0)), 2.5, 2.5)
+
+        # Far legs first, then the body, then near legs, so overlaps read right.
+        centre_depth = depth(scene.centre, yaw, pitch)
+        order = sorted(
+            range(len(scene.chains)),
+            key=lambda i: -depth(scene.chains[i][1], yaw, pitch),
+        )
+        far = [i for i in order if depth(scene.chains[i][1], yaw, pitch) > centre_depth]
+        near = [i for i in order if i not in far]
+        for i in far:
+            self._paint_leg(painter, scr, scene, i, far=True)
+        self._paint_body(painter, scr, scene)
+        for i in near:
+            self._paint_leg(painter, scr, scene, i, far=False)
+
+        tilt_pitch, tilt_roll = scene.level.tilt_deg()
+        painter.setPen(_C_HUD)
+        painter.drawText(
+            8,
+            int(h) - 8,
+            f"pitch {tilt_pitch:+.0f}°  roll {tilt_roll:+.0f}°  height {scene.level.height:.0f} mm",
+        )
+
+    def _paint_floor(self, painter: QPainter, scr, pose: BodyPose) -> None:
+        bx, by = pose.body_x, pose.body_y
+        pen = QPen(_C_GRID)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        for a, b in ground_grid_lines(0.0, origin_x=bx, origin_y=by):
+            painter.drawLine(scr(center_on_body(a, bx, by)), scr(center_on_body(b, bx, by)))
+        pen = QPen(_C_GRID_EDGE)
+        painter.setPen(pen)
+        gh = _GROUND_HALF
+        ox = math.floor(bx / _GROUND_STEP) * _GROUND_STEP
+        oy = math.floor(by / _GROUND_STEP) * _GROUND_STEP
+        edge = [(ox - gh, oy - gh), (ox + gh, oy - gh), (ox + gh, oy + gh), (ox - gh, oy + gh)]
+        for i in range(4):
+            a = center_on_body((*edge[i], 0.0), bx, by)
+            b = center_on_body((*edge[(i + 1) % 4], 0.0), bx, by)
+            painter.drawLine(scr(a), scr(b))
+
+    def _paint_body(self, painter: QPainter, scr, scene: Scene) -> None:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(61, 214, 198, 40))
+        painter.drawPolygon(QPolygonF([scr(p) for p in scene.body_top]))
+        pen = QPen(_C_BODY)
+        pen.setWidthF(2.0)
+        painter.setPen(pen)
+        top, bot = scene.body_top, scene.body_bottom
         for i in range(4):
             painter.drawLine(scr(top[i]), scr(top[(i + 1) % 4]))
             painter.drawLine(scr(bot[i]), scr(bot[(i + 1) % 4]))
             painter.drawLine(scr(top[i]), scr(bot[i]))
+        # Nose marker: which way is forward.
+        front_mid = (
+            (top[0][0] + top[1][0]) / 2,
+            (top[0][1] + top[1][1]) / 2,
+            (top[0][2] + top[1][2]) / 2,
+        )
+        painter.drawLine(scr(front_mid), scr(scene.nose))
 
-        pen_leg = QPen(QColor("#e8eaef"))
-        pen_leg.setWidth(2)
-        painter.setPen(pen_leg)
-        for i, foot in enumerate(feet):
-            painter.drawLine(scr(hips[i]), scr(foot))
-
-        painter.setBrush(QColor("#3dd6c6"))
+    def _paint_leg(self, painter: QPainter, scr, scene: Scene, i: int, *, far: bool) -> None:
+        chain = scene.chains[i]
+        pose = scene.pose
+        clamped = i < len(pose.clamped) and pose.clamped[i]
+        colour = _C_CLAMP if clamped else (_C_LEG_FAR if far else _C_LEG)
+        hip, coxa, knee, foot = (scr(p) for p in chain)
+        for a, b, width in ((hip, coxa, 4.0), (coxa, knee, 3.0), (knee, foot, 2.2)):
+            pen = QPen(colour)
+            pen.setWidthF(width)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(a, b)
         painter.setPen(Qt.PenStyle.NoPen)
-        for foot in feet:
-            p = scr(foot)
-            painter.drawEllipse(p, 4.0, 4.0)
+        painter.setBrush(colour)
+        painter.drawEllipse(knee, 3.0, 3.0)
+        # Swinging foot: a hollow ring and a drop line to the floor.
+        down = i < len(scene.contact) and scene.contact[i]
+        if down:
+            painter.setBrush(_C_BODY)
+            painter.drawEllipse(foot, 4.5, 4.5)
+        else:
+            pen = QPen(_C_BODY)
+            pen.setWidthF(1.5)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(foot, 4.5, 4.5)
+            pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setPen(pen)
+            p = chain[3]
+            painter.drawLine(foot, scr((p[0], p[1], 0.0)))
 
-        painter.end()
+
+def _convex_order(points: Sequence[Vec3]) -> list[Vec3]:
+    """Points sorted around their centroid, so they draw as a simple polygon."""
+    cx = sum(p[0] for p in points) / len(points)
+    cy = sum(p[1] for p in points) / len(points)
+    return sorted(points, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))

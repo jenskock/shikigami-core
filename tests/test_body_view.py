@@ -1,20 +1,33 @@
-"""Procedural body-view math (no display required)."""
+"""PiCrawler kinematics and body-view math (no display required)."""
 
-from shikigami.hal.picrawler.soft import SoftPicrawler
-from shikigami.hal.sim.body_view import (
+import math
+
+import pytest
+
+from shikigami.hal.picrawler.kinematics import (
     BODY_HALF,
-    WORLD_GROUND_Z,
+    COXA,
+    FEMUR,
+    TIBIA,
+    Leveler,
+    feet_world,
+    keyframe_secs,
+    leg_chain_local,
+    local_foot_to_body,
+    rotate_yaw_xy,
+    stance_odometry,
+    support_plane,
+)
+from shikigami.hal.picrawler.soft import MoveList, SoftPicrawler
+from shikigami.hal.sim.body_view import (
     body_to_world,
     center_on_body,
-    feet_world,
     ground_grid_lines,
-    integrate_stance_odometry,
-    local_foot_to_body,
     project_point,
-    rotate_yaw_xy,
-    snap_to_ground,
     to_screen,
 )
+
+STAND = [[45, 45, -50], [45, 0, -50], [45, 0, -50], [45, 45, -50]]
 
 
 def test_local_foot_to_body_rf_signs():
@@ -60,28 +73,9 @@ def test_to_screen_centers_origin():
 
 
 def test_ground_grid_lines_on_plane():
-    lines = ground_grid_lines(-50.0, half=64.0, step=32.0)
+    lines = ground_grid_lines(0.0, half=64.0, step=32.0)
     assert len(lines) >= 4
-    assert all(a[2] == -50.0 and b[2] == -50.0 for a, b in lines)
-
-
-def test_snap_keeps_lowest_feet_on_fixed_ground():
-    feet = [(0.0, 0.0, -50.0), (10.0, 0.0, -30.0), (0.0, 10.0, -50.0), (10.0, 10.0, -50.0)]
-    snapped, body_z = snap_to_ground(feet)
-    assert min(f[2] for f in snapped) == WORLD_GROUND_Z
-    assert snapped[1][2] == WORLD_GROUND_Z + 20.0  # lifted foot clears the floor
-    assert body_z == WORLD_GROUND_Z + 50.0
-
-
-def test_snap_all_legs_tucked_is_crouch_not_flight():
-    """When every foot tucks up, body drops — robot stays on the floor."""
-    stand = [(0.0, 0.0, -50.0)] * 4
-    tuck = [(0.0, 0.0, -30.0)] * 4
-    _, body_stand = snap_to_ground(stand)
-    snapped_tuck, body_tuck = snap_to_ground(tuck)
-    assert min(f[2] for f in snapped_tuck) == WORLD_GROUND_Z
-    assert body_tuck < body_stand
-    assert body_tuck == WORLD_GROUND_Z + 30.0
+    assert all(a[2] == 0.0 and b[2] == 0.0 for a, b in lines)
 
 
 def test_body_to_world_translates_and_yaws():
@@ -101,7 +95,7 @@ def test_center_on_body_keeps_robot_framed():
 
 
 def test_ground_grid_follows_origin():
-    lines = ground_grid_lines(-50.0, half=64.0, step=32.0, origin_x=100.0, origin_y=50.0)
+    lines = ground_grid_lines(0.0, half=64.0, step=32.0, origin_x=100.0, origin_y=50.0)
     xs = [a[0] for a, _ in lines] + [b[0] for _, b in lines]
     # Origin snaps to step grid (floor(100/32)*32 = 96); span stays ~2*half.
     assert min(xs) == 96.0 - 64.0
@@ -116,42 +110,80 @@ def test_rotate_yaw_xy_quarter_turn():
     assert abs(y - 1.0) < 1e-6
 
 
+def test_leg_chain_matches_the_robots_own_kinematics():
+    """Coxa, femur, tibia keep their lengths, and the foot lands where IK aimed it."""
+    c = SoftPicrawler()
+    for coord in ([45, 45, -50], [45, 0, -50], [70, 0, -30], [0, 120, 60], [20, 10, -70]):
+        alpha, beta, gamma = c.coord2polar(list(coord))
+        _, servo = c.limit_angle([beta, alpha, gamma])
+        hip, coxa, knee, foot = leg_chain_local(servo)
+        assert math.dist(hip, coxa) == pytest.approx(COXA)
+        assert math.dist(coxa, knee) == pytest.approx(FEMUR)
+        assert math.dist(knee, foot) == pytest.approx(TIBIA)
+        assert foot == pytest.approx(tuple(c.polar2coord(servo)), abs=0.05)
+        if coord[2] < 0:
+            assert knee[2] > foot[2]  # standing legs: the knee rides above the foot
+
+
+def test_standing_robot_is_level_on_four_feet():
+    support = support_plane(feet_world(STAND))
+    assert support.contact == (True, True, True, True)
+    level = Leveler.for_support(support)
+    assert level.height == pytest.approx(50.0)
+    assert level.tilt_deg() == pytest.approx((0.0, 0.0), abs=1e-6)
+
+
+def test_lifted_leg_hangs_in_the_air():
+    lifted = [list(c) for c in STAND]
+    lifted[1] = [70, 0, -30]
+    support = support_plane(feet_world(lifted))
+    assert support.contact == (True, False, True, True)
+    level = Leveler.for_support(support)
+    heights = [level.apply(f)[2] for f in feet_world(lifted)]
+    assert heights[1] == pytest.approx(20.0, abs=0.5)
+    assert [heights[i] for i in (0, 2, 3)] == pytest.approx([0.0, 0.0, 0.0], abs=1e-6)
+
+
+def test_body_tilt_keeps_feet_down():
+    """Shortening the rear legs pitches the nose up instead of floating the feet."""
+    feet = feet_world(MoveList().rotate_body_absolute_y(15))
+    support = support_plane(feet)
+    assert all(support.contact)
+    pitch, roll = Leveler.for_support(support).tilt_deg()
+    assert abs(pitch) + abs(roll) > 10.0
+
+
+def test_keyframe_time_follows_robot_hat():
+    assert keyframe_secs(30, 50) == pytest.approx(0.50)  # 1000 - 9.9 * 50 ms
+    assert keyframe_secs(30, 100) == pytest.approx(0.07)  # 428 deg/s cap
+    assert keyframe_secs(0, 50) == pytest.approx(0.01)
+
+
 def test_stance_odometry_planted_feet_push_body_forward():
-    """Planted feet sliding −Y in body frame → body advances +Y in the world."""
-    prev = [
-        (40.0, 40.0, -50.0),
-        (-40.0, 40.0, -50.0),
-        (-40.0, -40.0, -30.0),  # swing
-        (40.0, -40.0, -30.0),  # swing
-    ]
-    curr = [
-        (40.0, 20.0, -50.0),  # planted pushed back
-        (-40.0, 20.0, -50.0),
-        (-40.0, -20.0, -30.0),
-        (40.0, -20.0, -30.0),
-    ]
-    x, y, yaw = integrate_stance_odometry(prev, curr, 0.0, 0.0, 0.0)
-    assert abs(x) < 1e-6
-    assert abs(y - 20.0) < 1e-6  # −(−20) body motion
-    assert abs(yaw) < 1e-6
+    """Planted feet sliding back under the body carry the body forward."""
+    prev = [(40.0, 40.0, 0.0), (-40.0, 40.0, 0.0), (-40.0, -40.0, 0.0), (40.0, -40.0, 0.0)]
+    curr = [(40.0, 20.0, 0.0), (-40.0, 20.0, 0.0), (-40.0, -20.0, 0.0), (40.0, -20.0, 0.0)]
+    stance = [True, True, False, False]
+    x, y, yaw = stance_odometry(prev, curr, stance, 0.0, 0.0, 0.0)
+    assert (x, y) == pytest.approx((0.0, 20.0))
+    assert yaw == pytest.approx(0.0)
 
 
-def test_stance_odometry_yaw_from_planted_chord():
-    prev = [
-        (40.0, 0.0, -50.0),
-        (-40.0, 0.0, -50.0),
-        (0.0, 40.0, -30.0),
-        (0.0, -40.0, -30.0),
-    ]
-    # Planted pair rotates +90° in body frame → body yaw −90° to keep world fixed.
-    curr = [
-        (0.0, 40.0, -50.0),
-        (0.0, -40.0, -50.0),
-        (-40.0, 0.0, -30.0),
-        (40.0, 0.0, -30.0),
-    ]
-    _, _, yaw = integrate_stance_odometry(prev, curr, 0.0, 0.0, 0.0)
-    assert abs(_angle_wrap(yaw) + 90.0) < 1e-3
+def test_stance_odometry_turns_against_the_planted_feet():
+    prev = [(40.0, 0.0, 0.0), (-40.0, 0.0, 0.0), (0.0, 40.0, 0.0), (0.0, -40.0, 0.0)]
+    curr = [(0.0, 40.0, 0.0), (0.0, -40.0, 0.0), (-40.0, 0.0, 0.0), (40.0, 0.0, 0.0)]
+    _, _, yaw = stance_odometry(prev, curr, [True, True, False, False], 0.0, 0.0, 0.0)
+    assert _angle_wrap(yaw) == pytest.approx(-90.0)
+
+
+def test_swinging_feet_do_not_move_the_body():
+    prev = [(40.0, 40.0, 0.0)] * 4
+    curr = [(40.0, 90.0, 20.0)] * 4
+    assert stance_odometry(prev, curr, [False] * 4, 1.0, 2.0, 3.0) == (1.0, 2.0, 3.0)
+
+
+def test_rotate_yaw_xy_from_kinematics():
+    assert rotate_yaw_xy(1.0, 0.0, 90.0) == pytest.approx((0.0, 1.0))
 
 
 def _angle_wrap(deg: float) -> float:

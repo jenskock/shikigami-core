@@ -55,7 +55,11 @@ class PiDogMotion(Motion):
         )
 
     async def turn(
-        self, direction: str = "left", angle_deg: float | None = None, speed: float = 0.5
+        self,
+        direction: str = "left",
+        angle_deg: float | None = None,
+        speed: float = 0.5,
+        duration_s: float | None = None,
     ) -> None:
         self._log.info("[pidog] turn %s %s", direction, angle_deg)
         raise NotImplementedError("map turn() to pidog API (do_action('turn_left'/...) or servo)")
